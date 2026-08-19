@@ -1,0 +1,182 @@
+# host/test_teams_detector.py - Unit tests for TeamsDetector and TeamsLogTailer
+import json
+import os
+import shutil
+import tempfile
+import sys
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+
+try:
+    from host.teams_detector import (
+        STATUS_MAP,
+        TeamsAvailability,
+        TeamsDetector,
+        TeamsLogTailer,
+        TeamsStatusEvent,
+        WindowsHardwareTracker,
+        WindowsProcessTracker,
+        WindowsSessionTracker,
+        normalize_status,
+    )
+except ImportError:
+    from teams_detector import (
+        STATUS_MAP,
+        TeamsAvailability,
+        TeamsDetector,
+        TeamsLogTailer,
+        TeamsStatusEvent,
+        WindowsHardwareTracker,
+        WindowsProcessTracker,
+        WindowsSessionTracker,
+        normalize_status,
+    )
+
+
+class TestTeamsDetector(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="teams_test_logs_")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_status_normalization(self):
+        self.assertEqual(normalize_status("Available"), TeamsAvailability.AVAILABLE)
+        self.assertEqual(normalize_status("busy"), TeamsAvailability.BUSY)
+        self.assertEqual(normalize_status("DoNotDisturb"), TeamsAvailability.DO_NOT_DISTURB)
+        self.assertEqual(normalize_status("dnd"), TeamsAvailability.DO_NOT_DISTURB)
+        self.assertEqual(normalize_status("Focusing"), TeamsAvailability.DO_NOT_DISTURB)
+        self.assertEqual(normalize_status("Presenting"), TeamsAvailability.DO_NOT_DISTURB)
+        self.assertEqual(normalize_status("BeRightBack"), TeamsAvailability.BE_RIGHT_BACK)
+        self.assertEqual(normalize_status("away"), TeamsAvailability.AWAY)
+        self.assertEqual(normalize_status("Offline"), TeamsAvailability.OFFLINE)
+        self.assertEqual(normalize_status("PresenceUnknown"), TeamsAvailability.UNKNOWN)
+        self.assertEqual(normalize_status("UnknownRandom"), TeamsAvailability.UNKNOWN)
+
+    def test_log_tailer_initial_read(self):
+        log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("2026-08-19T10:00:00.000 <INFO> boot: starting...\n")
+            f.write("2026-08-19T10:00:01.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Busy}\n")
+
+        tailer = TeamsLogTailer(log_dir=self.test_dir)
+        availability, meeting_count = tailer.poll()
+
+        self.assertEqual(availability, TeamsAvailability.BUSY)
+        self.assertEqual(meeting_count, 0)
+
+    def test_log_tailer_incremental_append(self):
+        log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Available}\n")
+
+        tailer = TeamsLogTailer(log_dir=self.test_dir)
+        self.assertEqual(tailer.poll()[0], TeamsAvailability.AVAILABLE)
+
+        # Append new log lines
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write("2026-08-19T10:05:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: DoNotDisturb}\n")
+            f.write("2026-08-19T10:05:01.000 <DBG> cross_cloud::meetingstore: global state meetings size: 1\n")
+
+        availability, meeting_count = tailer.poll()
+        self.assertEqual(availability, TeamsAvailability.DO_NOT_DISTURB)
+        self.assertEqual(meeting_count, 1)
+
+    def test_log_tailer_global_state_parsing(self):
+        log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: BroadcastGlobalState: New Global State Event: UserDataGlobalState total number of users: 2 { availability: PresenceUnknown, unread notification count: 0 } { availability: Away, unread notification count: 0 }\n")
+
+        tailer = TeamsLogTailer(log_dir=self.test_dir)
+        availability, _ = tailer.poll()
+        self.assertEqual(availability, TeamsAvailability.AWAY)
+
+    def test_log_tailer_rotation(self):
+        log1 = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
+        with open(log1, "w", encoding="utf-8") as f:
+            f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Available}\n")
+
+        tailer = TeamsLogTailer(log_dir=self.test_dir)
+        self.assertEqual(tailer.poll()[0], TeamsAvailability.AVAILABLE)
+
+        time.sleep(0.05)
+        # Create a newer rotated log file
+        log2 = os.path.join(self.test_dir, "MSTeams_2026-08-19_02-00-00.00.log")
+        with open(log2, "w", encoding="utf-8") as f:
+            f.write("2026-08-19T11:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Busy}\n")
+
+        availability, _ = tailer.poll()
+        self.assertEqual(availability, TeamsAvailability.BUSY)
+        self.assertEqual(tailer.current_file, log2)
+
+    def test_status_event_json_serialization(self):
+        event = TeamsStatusEvent(
+            status="Busy",
+            availability="Busy",
+            in_call=True,
+            in_meeting=True,
+            mic_active=True,
+            camera_active=False,
+            is_running=True,
+            is_locked=False,
+            timestamp="2026-08-19T12:00:00+00:00",
+        )
+
+        data = event.to_dict()
+        self.assertEqual(data["type"], "teams_status")
+        self.assertEqual(data["status"], "Busy")
+        self.assertTrue(data["in_call"])
+
+        json_str = event.to_json()
+        parsed = json.loads(json_str)
+        self.assertEqual(parsed["status"], "Busy")
+        self.assertTrue(parsed["mic_active"])
+        self.assertFalse(parsed["camera_active"])
+
+    def test_detector_state_logic(self):
+        log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Available}\n")
+
+        detector = TeamsDetector(log_dir=self.test_dir)
+
+        mod_name = "host.teams_detector" if "host.teams_detector" in sys.modules else "teams_detector"
+        with patch(f"{mod_name}.WindowsProcessTracker.is_running") as mock_running, \
+             patch(f"{mod_name}.WindowsSessionTracker.is_locked") as mock_locked, \
+             patch(f"{mod_name}.WindowsHardwareTracker.is_mic_active") as mock_mic, \
+             patch(f"{mod_name}.WindowsHardwareTracker.is_camera_active") as mock_cam:
+
+            # 1. Normal Available state
+            mock_running.return_value = True
+            mock_locked.return_value = False
+            mock_mic.return_value = False
+            mock_cam.return_value = False
+
+            status = detector.get_status()
+            self.assertEqual(status.status, "Available")
+            self.assertFalse(status.in_call)
+
+            # 2. In Call (Mic active)
+            mock_mic.return_value = True
+            status = detector.get_status()
+            self.assertEqual(status.status, "InACall")
+            self.assertTrue(status.in_call)
+
+            # 3. Workstation Locked
+            mock_mic.return_value = False
+            mock_locked.return_value = True
+            status = detector.get_status()
+            self.assertEqual(status.status, "Away")
+            self.assertTrue(status.is_locked)
+
+            # 4. Teams closed / Not running
+            mock_locked.return_value = False
+            mock_running.return_value = False
+            status = detector.get_status()
+            self.assertEqual(status.status, "NotRunning")
+            self.assertFalse(status.is_running)
+
+
+if __name__ == "__main__":
+    unittest.main()
