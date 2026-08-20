@@ -11,15 +11,29 @@ Communication occurs over a USB CDC serial link operating at **115200 baud rate*
 ```mermaid
 graph TD
     subgraph Host ["Windows Host Machine"]
-        TM["host/teams_monitor.py (Standalone CLI Monitor)"]
-        TD["host/teams_detector.py (Local Detection Engine)"]
+        TM["host/teams_monitor.py (Daemon & Serial Dispatcher)"]
+        
+        subgraph TD_BOX ["host/teams_detector.py (Local Detection Engine)"]
+            TD["TeamsDetector (Aggregator & State Synthesizer)"]
+            TLT["TeamsLogTailer (Log Tailer & Rotation Handler)"]
+            WHT["WindowsHardwareTracker (Mic & Webcam CAM Registry)"]
+            WPT["WindowsProcessTracker (Toolhelp32 Snapshots)"]
+            WST["WindowsSessionTracker (OpenInputDesktop Lock Check)"]
+            
+            TD --> TLT
+            TD --> WHT
+            TD --> WPT
+            TD --> WST
+        end
+        
         HC["host/host_communicator.py (Interactive Terminal)"]
         MR["connect_mpremote.py / mpremote"]
         
-        TM --> TD
-        TD -.->|Live Tail Logs| T_LOGS["MSTeams_*.log (AppData)"]
-        TD -.->|Mic/Cam Hardware Check| T_REG["Windows Capability Registry"]
-        TD -.->|Process & Lock State| T_SYS["Windows System API"]
+        TM -->|poll_for_change and get_status| TD
+        TLT -.->|Tails Incremental Logs| T_LOGS["MSTeams log files in Local AppData"]
+        WHT -.->|Queries LastUsed Timestamps| T_REG["Windows CapabilityAccessManager Registry"]
+        WPT -.->|Scans Process Table| T_PROC["Win32 ms-teams.exe Process"]
+        WST -.->|Checks Input Desktop| T_LOCK["Win32 Session Lock State"]
     end
 
     subgraph Hardware ["USB Physical Layer"]
@@ -34,8 +48,8 @@ graph TD
     end
 
     TM -->|JSON Status Payloads| COM
-    HC <--->|Interactive Commands| COM
-    MR -.->|Flashing / Management| COM
+    HC <-->|Interactive Commands| COM
+    MR -.->|Flashing and Management| COM
 ```
 
 ---
@@ -162,24 +176,35 @@ OK: Teams status set to Available
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Teams as Microsoft Teams
+    participant OS as Windows OS (Logs / Registry / Win32)
+    participant Detector as host/teams_detector.py (TeamsDetector)
     participant Monitor as host/teams_monitor.py
     participant Serial as Serial Port (COM4)
     participant RP2040 as rp2040/code.py
     participant LED as Onboard RGB LED
 
     Monitor->>Serial: Open COM4 @ 115200 Baud
-    Monitor->>RP2040: Initial Status JSON (e.g. status="Available")
+    Monitor->>Detector: get_status()
+    Detector->>OS: Poll logs, mic/cam registry, process & lock state
+    OS-->>Detector: Baseline status (e.g. status="Available")
+    Detector-->>Monitor: TeamsStatusEvent(status="Available")
+    Monitor->>Serial: Write JSON {"type": "teams_status", "status": "Available", ...}
     RP2040->>LED: Set Color Green (0, 32, 0)
     RP2040-->>Monitor: OK: Teams status set to Available
 
-    loop Active Monitoring
-        alt Status / Call Change Detected
-            Teams->>Monitor: Log update / Mic active
-            Monitor->>Serial: Write JSON {"status": "InACall", "in_call": true}
+    loop Active Monitoring Loop (every 1.0s)
+        Monitor->>Detector: poll_for_change()
+        Detector->>OS: Incremental log tail, CAM registry check, process & session state
+        alt Presence or In-Call Change Detected
+            OS-->>Detector: Mic active / Status updated to "InACall"
+            Detector-->>Monitor: TeamsStatusEvent(status="InACall", in_call=True)
+            Monitor->>Serial: Write JSON {"type": "teams_status", "status": "InACall", "in_call": true}
             RP2040->>LED: Start Pulsing Bright Red (48, 0, 0)
             RP2040-->>Monitor: OK: Teams status set to InACall
-        else Periodic Keep-Alive (every 5s)
+        else No Change Detected (Heartbeat Timer >= 5s)
+            Detector-->>Monitor: None (No change)
+            Monitor->>Detector: get_status()
+            Detector-->>Monitor: Current TeamsStatusEvent
             Monitor->>Serial: Write JSON Heartbeat
             RP2040->>LED: Refresh active state
         end

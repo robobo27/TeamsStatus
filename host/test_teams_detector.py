@@ -1,4 +1,16 @@
-# host/test_teams_detector.py - Unit tests for TeamsDetector and TeamsLogTailer
+"""
+host/test_teams_detector.py - Unit test suite for TeamsDetector, TeamsLogTailer, and normalization.
+
+Test Coverage:
+  1. `test_status_normalization`: Validates string-to-enum canonical mapping across casing and abbreviations.
+  2. `test_log_tailer_initial_read`: Verifies initial log scan seeds user presence from `UserPresenceAction`.
+  3. `test_log_tailer_incremental_append`: Tests streaming tailing of newly appended lines and meeting size tracking.
+  4. `test_log_tailer_global_state_parsing`: Tests multi-user presence blocks from `UserDataGlobalState`.
+  5. `test_log_tailer_rotation`: Tests detection and transition to newly created / rotated log files.
+  6. `test_status_event_json_serialization`: Validates JSON schema formatting and dictionary conversion.
+  7. `test_detector_state_logic`: Tests state synthesis and priority resolution via mocking of Windows APIs.
+"""
+
 import json
 import os
 import shutil
@@ -35,13 +47,23 @@ except ImportError:
 
 
 class TestTeamsDetector(unittest.TestCase):
+    """
+    Test fixture providing isolated sandbox directories and comprehensive verification of detector logic.
+    """
+
     def setUp(self):
+        """Creates a temporary isolated log directory for each test run."""
         self.test_dir = tempfile.mkdtemp(prefix="teams_test_logs_")
 
     def tearDown(self):
+        """Cleans up the temporary log directory and any mock artifacts."""
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_status_normalization(self):
+        """
+        Verifies that various string formats (casing variations, synonyms, abbreviations)
+        map correctly to canonical TeamsAvailability enum values.
+        """
         self.assertEqual(normalize_status("Available"), TeamsAvailability.AVAILABLE)
         self.assertEqual(normalize_status("busy"), TeamsAvailability.BUSY)
         self.assertEqual(normalize_status("DoNotDisturb"), TeamsAvailability.DO_NOT_DISTURB)
@@ -55,6 +77,10 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertEqual(normalize_status("UnknownRandom"), TeamsAvailability.UNKNOWN)
 
     def test_log_tailer_initial_read(self):
+        """
+        Verifies that when TeamsLogTailer initializes, it reads the pre-existing
+        log file to discover the most recent presence state.
+        """
         log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
         with open(log_file, "w", encoding="utf-8") as f:
             f.write("2026-08-19T10:00:00.000 <INFO> boot: starting...\n")
@@ -67,6 +93,10 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertEqual(meeting_count, 0)
 
     def test_log_tailer_incremental_append(self):
+        """
+        Verifies that after the initial scan, subsequent poll() calls process
+        only newly appended lines without replaying older lines.
+        """
         log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
         with open(log_file, "w", encoding="utf-8") as f:
             f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Available}\n")
@@ -74,7 +104,7 @@ class TestTeamsDetector(unittest.TestCase):
         tailer = TeamsLogTailer(log_dir=self.test_dir)
         self.assertEqual(tailer.poll()[0], TeamsAvailability.AVAILABLE)
 
-        # Append new log lines
+        # Simulate Teams appending new events to the active log file
         with open(log_file, "a", encoding="utf-8") as f:
             f.write("2026-08-19T10:05:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: DoNotDisturb}\n")
             f.write("2026-08-19T10:05:01.000 <DBG> cross_cloud::meetingstore: global state meetings size: 1\n")
@@ -84,6 +114,9 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertEqual(meeting_count, 1)
 
     def test_log_tailer_global_state_parsing(self):
+        """
+        Verifies extraction of availability from multi-user UserDataGlobalState blocks.
+        """
         log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
         with open(log_file, "w", encoding="utf-8") as f:
             f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: BroadcastGlobalState: New Global State Event: UserDataGlobalState total number of users: 2 { availability: PresenceUnknown, unread notification count: 0 } { availability: Away, unread notification count: 0 }\n")
@@ -93,6 +126,10 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertEqual(availability, TeamsAvailability.AWAY)
 
     def test_log_tailer_rotation(self):
+        """
+        Verifies that when Teams starts writing to a new log file (e.g. after restart),
+        TeamsLogTailer detects the newer file and switches to tailing it.
+        """
         log1 = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
         with open(log1, "w", encoding="utf-8") as f:
             f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Available}\n")
@@ -101,7 +138,7 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertEqual(tailer.poll()[0], TeamsAvailability.AVAILABLE)
 
         time.sleep(0.05)
-        # Create a newer rotated log file
+        # Create a newer rotated log file with a later timestamp
         log2 = os.path.join(self.test_dir, "MSTeams_2026-08-19_02-00-00.00.log")
         with open(log2, "w", encoding="utf-8") as f:
             f.write("2026-08-19T11:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Busy}\n")
@@ -111,6 +148,9 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertEqual(tailer.current_file, log2)
 
     def test_status_event_json_serialization(self):
+        """
+        Verifies that TeamsStatusEvent serializes cleanly to a dictionary and valid JSON string.
+        """
         event = TeamsStatusEvent(
             status="Busy",
             availability="Busy",
@@ -135,6 +175,13 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertFalse(parsed["camera_active"])
 
     def test_detector_state_logic(self):
+        """
+        Verifies the precedence rules of TeamsDetector by mocking Windows API trackers:
+          - Running + Unlocked + Mic off -> Available
+          - Running + Unlocked + Mic on  -> InACall
+          - Running + Locked             -> Away
+          - Not running                  -> NotRunning
+        """
         log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
         with open(log_file, "w", encoding="utf-8") as f:
             f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Available}\n")
@@ -147,7 +194,7 @@ class TestTeamsDetector(unittest.TestCase):
              patch(f"{mod_name}.WindowsHardwareTracker.is_mic_active") as mock_mic, \
              patch(f"{mod_name}.WindowsHardwareTracker.is_camera_active") as mock_cam:
 
-            # 1. Normal Available state
+            # 1. Normal Available state: Teams running, session unlocked, mic & cam inactive
             mock_running.return_value = True
             mock_locked.return_value = False
             mock_mic.return_value = False
@@ -157,20 +204,20 @@ class TestTeamsDetector(unittest.TestCase):
             self.assertEqual(status.status, "Available")
             self.assertFalse(status.in_call)
 
-            # 2. In Call (Mic active)
+            # 2. In Call state: Microphone becomes active during a voice/video call
             mock_mic.return_value = True
             status = detector.get_status()
             self.assertEqual(status.status, "InACall")
             self.assertTrue(status.in_call)
 
-            # 3. Workstation Locked
+            # 3. Workstation Locked: User locks their computer (Win+L)
             mock_mic.return_value = False
             mock_locked.return_value = True
             status = detector.get_status()
             self.assertEqual(status.status, "Away")
             self.assertTrue(status.is_locked)
 
-            # 4. Teams closed / Not running
+            # 4. Teams closed: Application terminated
             mock_locked.return_value = False
             mock_running.return_value = False
             status = detector.get_status()
@@ -180,3 +227,4 @@ class TestTeamsDetector(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
