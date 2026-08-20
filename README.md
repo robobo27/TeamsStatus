@@ -259,22 +259,58 @@ Or run in console-only standalone mode (without serial connection):
 python host/teams_monitor.py --standalone
 ```
 
-#### CLI Options for `teams_monitor.py`
+#### CLI Options for `teams_monitor.py` / `TeamsMonitor.exe`
 | Argument | Description | Default |
 | :--- | :--- | :--- |
 | `-p`, `--port` | Target USB Serial COM port | `COM4` |
 | `-b`, `--baudrate` | Serial baud rate | `115200` |
 | `-i`, `--interval` | Log & state polling interval in seconds | `1.0` |
 | `-H`, `--heartbeat` | Periodic serial heartbeat interval in seconds (`0` to disable) | `5.0` |
-| `-s`, `--standalone`, `--no-serial` | Run in console-only mode without opening a COM port | `False` |
+| `-s`, `--standalone` | Run in console-only mode without opening a COM port | `False` |
 | `--log-dir` | Custom path to Microsoft Teams log directory | Auto-detected |
+| `--log-file` | Path to save diagnostic log output (ideal for background execution) | `None` |
+| `--install-startup` | Register monitor to start automatically on Windows logon | `None` |
+| `--uninstall-startup` | Remove monitor from Windows Startup | `False` |
+| `--startup-status` | Display current Windows Startup registration status | `False` |
 
-### 4. Run Automated Unit Tests
+---
+
+### 4. Build Standalone `.exe` & Auto-Start on Windows
+
+You can package the monitor into a single windowless executable (`dist/TeamsMonitor.exe`) that starts automatically in the background when you log into Windows:
+
+#### Step 1: Build the Executable
+```powershell
+# Using the batch shortcut or Python builder
+.\build_exe.bat
+# or: python build_exe.py
+```
+This produces `dist\TeamsMonitor.exe` (~7.9 MB, compiled with `--noconsole` for silent execution).
+
+#### Step 2: Register with Windows Startup (One-Time Setup)
+```powershell
+dist\TeamsMonitor.exe --install-startup
+```
+This registers `TeamsMonitor.exe` directly into `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.  
+It will automatically appear in **Windows Task Manager > Startup apps** tab with an **Enabled/Disabled** toggle.
+
+#### Step 3: Check or Manage Startup Anytime
+```powershell
+# Check current registration:
+dist\TeamsMonitor.exe --startup-status
+
+# Remove from Windows startup:
+dist\TeamsMonitor.exe --uninstall-startup
+```
+
+---
+
+### 5. Run Automated Unit Tests
 ```powershell
 python -m unittest discover -s host -p "test_*.py"
 ```
 
-### 5. Run the Interactive Host Terminal (Manual Test Mode)
+### 6. Run the Interactive Host Terminal (Manual Test Mode)
 ```powershell
 python host/host_communicator.py
 ```
@@ -291,3 +327,4 @@ python host/host_communicator.py COM4 -b 115200
 * **No Response / Timeout**: Ensure `boot.py`, `main.py`, and `code.py` have been uploaded to the RP2040 board using `python connect_mpremote.py cp ...` and reset using `python connect_mpremote.py reset`.
 * **Custom Teams Log Location**: If your Teams installation logs to a custom directory, pass `--log-dir "C:\path\to\Logs"`.
 * **Board Hardware Compatibility**: Works with standard Raspberry Pi Pico (onboard single-color LED) and RP2040 boards with WS2812 NeoPixel LEDs (e.g. Waveshare RP2040-Zero, RP2040-Matrix, Adafruit Feather RP2040).
+

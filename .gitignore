@@ -20,3 +20,12 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# PyInstaller build outputs
+build/
+dist/
+*.spec
+
+# Logs
+*.log
+

@@ -15,14 +15,17 @@ Key Responsibilities:
   5. Provide formatted, real-time terminal output with ASCII badges.
   6. Gracefully shut down upon Ctrl+C by sending an 'Offline' event to the board to turn off LEDs.
   7. Support standalone console-only mode (`--standalone` or `--no-serial`) when no hardware is attached.
+  8. Manage Windows Startup registration (`--install-startup`, `--uninstall-startup`, `--startup-status`).
 """
 
 import argparse
+import io
 import json
 import os
 import sys
 import time
 from typing import Optional
+import winreg
 
 # Graceful optional import of pySerial
 try:
@@ -37,6 +40,149 @@ try:
     from host.teams_detector import TeamsDetector, TeamsStatusEvent
 except ImportError:
     from teams_detector import TeamsDetector, TeamsStatusEvent
+
+# Windows Registry autorun key
+STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_APP_NAME = "USBCommunicator_TeamsMonitor"
+
+
+class NullWriter:
+    """Fallback stream writer that silently discards output when running without a console."""
+    def write(self, text):
+        pass
+    def flush(self):
+        pass
+
+
+def attach_parent_console_if_available():
+    """
+    If running as a --noconsole GUI binary from an existing terminal/command prompt,
+    attaches standard I/O to the parent console so CLI output is visible.
+    When launched by Windows Startup or double-clicked, this silently fails
+    leaving the process 100% invisible/windowless.
+    """
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        try:
+            import ctypes
+            # ATTACH_PARENT_PROCESS = -1 (0xFFFFFFFF)
+            ATTACH_PARENT_PROCESS = -1
+            if ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
+                sys.stdout = io.TextIOWrapper(
+                    open(r"\\.\CONOUT$", "wt", encoding="utf-8", errors="replace"),
+                    encoding="utf-8",
+                    line_buffering=True,
+                )
+                sys.stderr = io.TextIOWrapper(
+                    open(r"\\.\CONOUT$", "wt", encoding="utf-8", errors="replace"),
+                    encoding="utf-8",
+                    line_buffering=True,
+                )
+        except Exception:
+            pass
+
+
+class DualLogger:
+
+    """Tee logger that writes to both the console stream and a persistent log file."""
+    def __init__(self, console_stream, file_path: str):
+        self.console = console_stream
+        self.file = open(file_path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, text):
+        if self.console:
+            try:
+                self.console.write(text)
+            except Exception:
+                pass
+        try:
+            self.file.write(text)
+        except Exception:
+            pass
+
+    def flush(self):
+        if self.console:
+            try:
+                self.console.flush()
+            except Exception:
+                pass
+        try:
+            self.file.flush()
+        except Exception:
+            pass
+
+
+def get_startup_target_command(extra_args: str = "--port COM4") -> str:
+    """
+    Constructs the exact command string to register in Windows Startup.
+    
+    Handles both compiled PyInstaller .exe binaries and raw Python scripts.
+    """
+    clean_args = f" {extra_args.strip()}" if extra_args.strip() else ""
+    if getattr(sys, "frozen", False):
+        # Running as compiled PyInstaller standalone .exe
+        target_path = sys.executable
+        return f'"{target_path}"{clean_args}'
+    else:
+        # Running as raw Python script in virtual environment or system Python
+        # Prefer pythonw.exe if available to run invisibly without a console window
+        python_dir = os.path.dirname(sys.executable)
+        pythonw_candidate = os.path.join(python_dir, "pythonw.exe")
+        python_bin = pythonw_candidate if os.path.exists(pythonw_candidate) else sys.executable
+
+        script_path = os.path.abspath(__file__)
+        return f'"{python_bin}" "{script_path}"{clean_args}'
+
+
+def install_startup(extra_args: str = "--port COM4") -> bool:
+    """
+    Registers the monitor daemon in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.
+    """
+    cmd = get_startup_target_command(extra_args)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, STARTUP_APP_NAME, 0, winreg.REG_SZ, cmd)
+        print("=" * 60)
+        print("  Windows Startup Registration: SUCCESS")
+        print("=" * 60)
+        print(f"App Name : {STARTUP_APP_NAME}")
+        print(f"Command  : {cmd}")
+        print("\nStatus: The monitor is now registered to start automatically on Windows logon.")
+        print("You can view and toggle it anytime in Task Manager -> 'Startup apps' tab.\n")
+        return True
+    except Exception as e:
+        print(f"Error registering Windows startup key: {e}")
+        return False
+
+
+def uninstall_startup() -> bool:
+    """
+    Removes the monitor daemon from HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, STARTUP_APP_NAME)
+        print(f"Successfully removed '{STARTUP_APP_NAME}' from Windows Startup.")
+        return True
+    except FileNotFoundError:
+        print(f"Notice: '{STARTUP_APP_NAME}' is not currently registered in Windows Startup.")
+        return True
+    except Exception as e:
+        print(f"Error removing Windows startup key: {e}")
+        return False
+
+
+def get_startup_status() -> Optional[str]:
+    """
+    Queries whether the monitor is currently registered in Windows Startup.
+    """
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, STARTUP_APP_NAME)
+            return val
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
 
 
 def format_status_badge(status: str) -> str:
@@ -119,17 +265,12 @@ def main():
     """
     Main entry point and execution loop for the Teams Monitor daemon.
     
-    Parses CLI parameters, opens serial link (if enabled), polls detector,
-    dispatches events, and handles heartbeat intervals.
+    Parses CLI parameters, handles startup registration, opens serial link (if enabled),
+    polls detector, dispatches events, and handles heartbeat intervals.
     """
-    # Reconfigure stdout for UTF-8 output if the host terminal allows it
-    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-        try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+    # If run as a GUI/windowless binary from a terminal, attach to caller console
+    attach_parent_console_if_available()
 
-    # Configure command-line arguments
     parser = argparse.ArgumentParser(
         description="Local Microsoft Teams Status Monitor (Zero Network / Zero Graph API)"
     )
@@ -172,7 +313,76 @@ def main():
         default=None,
         help="Custom path to Microsoft Teams logs directory",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="File path to save monitor diagnostic logs (ideal for background execution)",
+    )
+    # Startup management CLI arguments
+    parser.add_argument(
+        "--install-startup",
+        nargs="?",
+        const="--port COM4",
+        default=None,
+        help="Register this application in Windows Startup (HKCU\\...\\Run) with optional arguments",
+    )
+    parser.add_argument(
+        "--uninstall-startup",
+        action="store_true",
+        help="Remove this application from Windows Startup (HKCU\\...\\Run)",
+    )
+    parser.add_argument(
+        "--startup-status",
+        action="store_true",
+        help="Check whether this application is currently configured in Windows Startup",
+    )
     args = parser.parse_args()
+
+    # -------------------------------------------------------------
+    # Handle Windows Startup Management CLI Commands First
+    # -------------------------------------------------------------
+    if args.startup_status:
+        current = get_startup_status()
+        if current:
+            print("=" * 60)
+            print("  Windows Startup Status: ENABLED")
+            print("=" * 60)
+            print(f"Registry Key : HKCU\\{STARTUP_REG_KEY}")
+            print(f"Entry Name   : {STARTUP_APP_NAME}")
+            print(f"Command      : {current}")
+        else:
+            print("=" * 60)
+            print("  Windows Startup Status: DISABLED")
+            print("=" * 60)
+            print(f"'{STARTUP_APP_NAME}' is not registered in HKCU\\{STARTUP_REG_KEY}.")
+            print("To enable auto-start, run with: --install-startup")
+        sys.exit(0)
+
+    if args.uninstall_startup:
+        uninstall_startup()
+        sys.exit(0)
+
+    if args.install_startup is not None:
+        install_startup(args.install_startup)
+        sys.exit(0)
+
+    # -------------------------------------------------------------
+    # Configure stdout/stderr Stream Safety (Headless / pythonw / .exe)
+    # -------------------------------------------------------------
+    if args.log_file:
+        # User specified a log file: tee output to file and console (if available)
+        logger = DualLogger(sys.stdout, args.log_file)
+        sys.stdout = logger
+        sys.stderr = logger
+    elif sys.stdout is None:
+        # Running under pythonw.exe or PyInstaller --noconsole without explicit log file
+        sys.stdout = NullWriter()
+        sys.stderr = NullWriter()
+    elif sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     # Display startup configuration banner
     print("=" * 65)
@@ -182,6 +392,8 @@ def main():
     print(f"Poll Interval : {args.interval}s")
     print(f"Heartbeat     : {args.heartbeat}s")
     print(f"Serial Target : {'Disabled (Standalone)' if args.standalone else f'{args.port} @ {args.baudrate}'}")
+    if args.log_file:
+        print(f"Logging To    : {args.log_file}")
     print("-" * 65)
 
     # Instantiate detector
@@ -242,4 +454,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
