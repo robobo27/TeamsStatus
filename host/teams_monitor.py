@@ -111,7 +111,75 @@ class DualLogger:
             pass
 
 
-def get_startup_target_command(extra_args: str = "--port COM4") -> str:
+# Hardware identifiers for Raspberry Pi RP2040 / Pico / MicroPython devices
+KNOWN_MICROCONTROLLER_VIDS = {
+    0x2E8A,  # Raspberry Pi Foundation (Pico, Pico W, Pico 2, RP2040-Zero, MicroPython CDC)
+    0x239A,  # Adafruit (Feather RP2040, QT Py RP2040, Trinkey RP2040)
+    0x1B4F,  # SparkFun (Pro Micro RP2040, Thing Plus RP2040)
+}
+
+KNOWN_DEVICE_KEYWORDS = (
+    "micropython",
+    "rp2040",
+    "pico",
+    "raspberry pi",
+    "usb serial device",
+)
+
+
+def find_microcontroller_port(preferred_port: Optional[str] = None) -> Optional[str]:
+    """
+    Auto-discovers the COM port of the connected RP2040 microcontroller.
+
+    Scan Strategy:
+      1. If preferred_port is specified (e.g. 'COM4') and present in active ports, select it.
+      2. Match USB Vendor ID (VID 0x2E8A Raspberry Pi / RP2040, 0x239A Adafruit, 0x1B4F SparkFun).
+      3. Match hardware descriptors and strings ('MicroPython', 'RP2040', 'Pico').
+      4. Match generic USB serial CDC devices (ignoring virtual ports like u-blox, Bluetooth, etc.).
+
+    Returns:
+        str or None: The COM port device name (e.g., 'COM4'), or None if not found.
+    """
+    if not SERIAL_AVAILABLE:
+        return None
+
+    try:
+        ports = list(serial.tools.list_ports.comports())
+    except Exception:
+        return None
+
+    if not ports:
+        return None
+
+    # Priority 1: Check if user preferred port is actively connected
+    if preferred_port and preferred_port.lower() != "auto":
+        for p in ports:
+            if p.device.upper() == preferred_port.upper():
+                return p.device
+
+    # Priority 2: Match known hardware Vendor IDs (Raspberry Pi VID 0x2E8A, Adafruit, SparkFun)
+    for p in ports:
+        if p.vid is not None and p.vid in KNOWN_MICROCONTROLLER_VIDS:
+            return p.device
+
+    # Priority 3: Match descriptors / HWID strings
+    for p in ports:
+        info_str = f"{p.device} {p.description} {p.hwid} {p.manufacturer or ''} {p.product or ''}".lower()
+        # Exclude known non-microcontroller virtual ports (e.g. u-blox GPS, Bluetooth, modems)
+        if "u-blox" in info_str or "bluetooth" in info_str or "modem" in info_str:
+            continue
+        if any(keyword in info_str for keyword in KNOWN_DEVICE_KEYWORDS):
+            return p.device
+
+    # Priority 4: If single USB serial port with valid VID/PID exists, select it
+    usb_ports = [p for p in ports if p.vid is not None]
+    if len(usb_ports) == 1:
+        return usb_ports[0].device
+
+    return None
+
+
+def get_startup_target_command(extra_args: str = "--port auto") -> str:
     """
     Constructs the exact command string to register in Windows Startup.
     
@@ -133,7 +201,7 @@ def get_startup_target_command(extra_args: str = "--port COM4") -> str:
         return f'"{python_bin}" "{script_path}"{clean_args}'
 
 
-def install_startup(extra_args: str = "--port COM4") -> bool:
+def install_startup(extra_args: str = "--port auto") -> bool:
     """
     Registers the monitor daemon in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.
     """
@@ -209,19 +277,21 @@ def format_status_badge(status: str) -> str:
     return symbols.get(status, f"[{status.upper()}]")
 
 
-def open_serial_connection(port: str, baudrate: int) -> Optional["serial.Serial"]:
+def open_serial_connection(port: str, baudrate: int, quiet: bool = False) -> Optional["serial.Serial"]:
     """
     Attempts to establish and configure a serial connection to the RP2040 microcontroller.
 
     Args:
         port (str): Serial COM port identifier (e.g., 'COM4').
         baudrate (int): Baud rate for UART communication (default: 115200).
+        quiet (bool): Suppress notice messages during background polling.
 
     Returns:
         serial.Serial or None: An active serial handle, or None if unavailable/unsupported.
     """
     if not SERIAL_AVAILABLE:
-        print("Warning: pyserial is not installed. Running in console-only mode.")
+        if not quiet:
+            print("Warning: pyserial is not installed. Running in console-only mode.")
         return None
 
     try:
@@ -230,15 +300,16 @@ def open_serial_connection(port: str, baudrate: int) -> Optional["serial.Serial"
         # Flush initial buffers
         ser.reset_input_buffer()
         ser.reset_output_buffer()
-        print(f"Connected to Microcontroller on {port} @ {baudrate} baud.")
+        if not quiet:
+            print(f"Connected to Microcontroller on {port} @ {baudrate} baud.")
         return ser
-    except serial.SerialException as e:
-        # Fall back to console-only mode if the COM port cannot be opened
-        print(f"Notice: Serial port {port} unavailable ({e}). Continuing in console-only mode.")
+    except (serial.SerialException, OSError) as e:
+        if not quiet:
+            print(f"Notice: Serial port {port} unavailable ({e}). Running in auto-reconnect mode.")
         return None
 
 
-def send_serial_event(ser: Optional["serial.Serial"], event: TeamsStatusEvent):
+def send_serial_event(ser: Optional["serial.Serial"], event: TeamsStatusEvent) -> bool:
     """
     Serializes a TeamsStatusEvent to JSON and transmits it across the serial link.
 
@@ -248,25 +319,34 @@ def send_serial_event(ser: Optional["serial.Serial"], event: TeamsStatusEvent):
     Args:
         ser (serial.Serial, optional): Open serial connection object.
         event (TeamsStatusEvent): Status event object to transmit.
+
+    Returns:
+        bool: True if transmitted successfully, False if connection error occurred.
     """
     if ser is None or not ser.is_open:
-        return
+        return False
 
     # Encode JSON line ending with newline character (\n)
     payload = event.to_json() + "\n"
     try:
         ser.write(payload.encode("utf-8"))
         ser.flush()  # Force byte transmission over USB CDC
-    except Exception as e:
-        print(f"Serial transmission error: {e}")
+        return True
+    except (serial.SerialException, OSError, Exception) as e:
+        print(f"Serial transmission error ({e}). Closing port to trigger auto-reconnect...")
+        try:
+            ser.close()
+        except Exception:
+            pass
+        return False
 
 
 def main():
     """
     Main entry point and execution loop for the Teams Monitor daemon.
     
-    Parses CLI parameters, handles startup registration, opens serial link (if enabled),
-    polls detector, dispatches events, and handles heartbeat intervals.
+    Parses CLI parameters, handles startup registration, manages dynamic auto-discovery
+    and hot-plug reconnection, polls detector, dispatches events, and handles heartbeat intervals.
     """
     # If run as a GUI/windowless binary from a terminal, attach to caller console
     attach_parent_console_if_available()
@@ -277,8 +357,8 @@ def main():
     parser.add_argument(
         "-p",
         "--port",
-        default="COM4",
-        help="Target USB Serial COM port for RP2040 (default: COM4)",
+        default="auto",
+        help="Target USB Serial COM port for RP2040, or 'auto' for dynamic VID/PID hardware discovery (default: auto)",
     )
     parser.add_argument(
         "-b",
@@ -322,9 +402,9 @@ def main():
     parser.add_argument(
         "--install-startup",
         nargs="?",
-        const="--port COM4",
+        const="--port auto",
         default=None,
-        help="Register this application in Windows Startup (HKCU\\...\\Run) with optional arguments",
+        help="Register this application in Windows Startup (HKCU\\...\\Run) with optional arguments (default: --port auto)",
     )
     parser.add_argument(
         "--uninstall-startup",
@@ -391,7 +471,7 @@ def main():
     print(f"Log Dir       : {args.log_dir or 'Auto-detected (Local MSTeams package)'}")
     print(f"Poll Interval : {args.interval}s")
     print(f"Heartbeat     : {args.heartbeat}s")
-    print(f"Serial Target : {'Disabled (Standalone)' if args.standalone else f'{args.port} @ {args.baudrate}'}")
+    print(f"Serial Target : {'Disabled (Standalone)' if args.standalone else (f'Auto-Discovery (Hardware VID 0x2E8A)' if args.port == 'auto' else f'{args.port} @ {args.baudrate}')}")
     if args.log_file:
         print(f"Logging To    : {args.log_file}")
     print("-" * 65)
@@ -399,10 +479,20 @@ def main():
     # Instantiate detector
     detector = TeamsDetector(log_dir=args.log_dir)
 
-    # Establish serial connection if not in standalone mode
+    # Initialize serial connection variables
     ser: Optional["serial.Serial"] = None
+    active_port: Optional[str] = None
+    last_reconnect_attempt = 0.0
+
+    # Initial port connection attempt
     if not args.standalone:
-        ser = open_serial_connection(args.port, args.baudrate)
+        init_port = find_microcontroller_port(args.port)
+        if init_port:
+            ser = open_serial_connection(init_port, args.baudrate)
+            if ser:
+                active_port = init_port
+        else:
+            print("Notice: No RP2040 board detected at startup. Standing by in auto-reconnect mode...")
 
     last_heartbeat_time = 0.0
 
@@ -410,9 +500,28 @@ def main():
 
     try:
         while True:
+            now = time.time()
+
+            # -------------------------------------------------------------
+            # Hot-Plug / Auto-Reconnect Management
+            # -------------------------------------------------------------
+            if not args.standalone and (ser is None or not ser.is_open):
+                # Try auto-detecting and connecting every 2.0 seconds
+                if (now - last_reconnect_attempt) >= 2.0:
+                    last_reconnect_attempt = now
+                    target_port = find_microcontroller_port(args.port)
+                    if target_port:
+                        ser = open_serial_connection(target_port, args.baudrate, quiet=(active_port == target_port))
+                        if ser and ser.is_open:
+                            active_port = target_port
+                            print(f"[{time.strftime('%H:%M:%S')}] Microcontroller attached on {target_port}! Synchronizing state...")
+                            # Immediately push current status upon connection
+                            current_snap = detector.get_status()
+                            send_serial_event(ser, current_snap)
+                            last_heartbeat_time = now
+
             # Poll detector for any newly detected state changes
             event = detector.poll_for_change()
-            now = time.time()
 
             if event is not None:
                 # Format detailed console status line
@@ -421,20 +530,25 @@ def main():
                 mic_info = " [Mic Active]" if event.mic_active else ""
                 cam_info = " [Cam Active]" if event.camera_active else ""
                 lock_info = " [PC Locked]" if event.is_locked else ""
+                port_tag = f" [{active_port}]" if (ser and ser.is_open and active_port) else " [No Serial]"
 
                 print(
-                    f"[{time.strftime('%H:%M:%S')}] {badge:20} Status: {event.status:12} "
+                    f"[{time.strftime('%H:%M:%S')}]{port_tag} {badge:20} Status: {event.status:12} "
                     f"(Raw: {event.availability}){call_info}{mic_info}{cam_info}{lock_info}",
                     flush=True,
                 )
 
                 # Transmit event to RP2040 microcontroller
-                send_serial_event(ser, event)
+                if ser and ser.is_open:
+                    if not send_serial_event(ser, event):
+                        ser = None
                 last_heartbeat_time = now
             elif args.heartbeat > 0 and (now - last_heartbeat_time) >= args.heartbeat:
                 # Send periodic heartbeat frame to keep microcontroller state refreshed
                 current_status = detector.get_status()
-                send_serial_event(ser, current_status)
+                if ser and ser.is_open:
+                    if not send_serial_event(ser, current_status):
+                        ser = None
                 last_heartbeat_time = now
 
             # Sleep for the configured poll interval
@@ -448,11 +562,15 @@ def main():
             exit_event = detector.get_status()
             exit_event.status = "Offline"
             send_serial_event(ser, exit_event)
-            ser.close()
+            try:
+                ser.close()
+            except Exception:
+                pass
             print("Serial connection closed.")
 
 
 if __name__ == "__main__":
     main()
+
 
 

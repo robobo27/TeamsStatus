@@ -262,16 +262,17 @@ python host/teams_monitor.py --standalone
 #### CLI Options for `teams_monitor.py` / `TeamsMonitor.exe`
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `-p`, `--port` | Target USB Serial COM port | `COM4` |
+| `-p`, `--port` | Target USB Serial COM port, or `'auto'` for hardware auto-discovery | `auto` |
 | `-b`, `--baudrate` | Serial baud rate | `115200` |
 | `-i`, `--interval` | Log & state polling interval in seconds | `1.0` |
 | `-H`, `--heartbeat` | Periodic serial heartbeat interval in seconds (`0` to disable) | `5.0` |
 | `-s`, `--standalone` | Run in console-only mode without opening a COM port | `False` |
 | `--log-dir` | Custom path to Microsoft Teams log directory | Auto-detected |
 | `--log-file` | Path to save diagnostic log output (ideal for background execution) | `None` |
-| `--install-startup` | Register monitor to start automatically on Windows logon | `None` |
+| `--install-startup` | Register monitor to start automatically on Windows logon (default: `--port auto`) | `None` |
 | `--uninstall-startup` | Remove monitor from Windows Startup | `False` |
 | `--startup-status` | Display current Windows Startup registration status | `False` |
+
 
 ---
 
