@@ -26,6 +26,8 @@ build/
 dist/
 *.spec
 
-# Logs
+# Logs & Scratch
 *.log
+scratch/
+
 
