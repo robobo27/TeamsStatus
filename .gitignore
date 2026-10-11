@@ -30,4 +30,8 @@ dist/
 *.log
 scratch/
 
-
+# LTspice simulation outputs
+*.raw
+*.op.raw
+*.db
+simulation/*.net

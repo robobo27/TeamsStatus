@@ -1,0 +1,139 @@
+* ==============================================================================
+* Circuit: USB-C Powered RP2040 Microcontroller and LR7843 MOSFET LED Driver
+* Tool: LTspice 26.x / XVII (Analog Devices)
+* File: usb_rp2040_lr7843.cir
+* ==============================================================================
+* Description:
+*   - Input: USB Type-C Receptacle (5V VBUS, GND, CC1, CC2, D+, D-)
+*   - CC1 / CC2: 5.1k Ohm pull-downs for USB-C UFP (Device) power negotiation
+*   - Power: 5V VBUS stepped down to 3.3V via LDO (AP2112K-3.3) for RP2040
+*   - USB Data: D+ and D- terminated with 27 Ohm resistors to RP2040 USB transceiver
+*   - RP2040 GPIO: Drives PWM control signal (3.3V logic) to LR7843 module
+*   - LR7843 Module: Optocoupler (PC817) isolation driving IRLR7843 N-MOSFET gate
+*   - Load: White LED (Vf approx 3.0V) with 100 Ohm ballast resistor (20mA nominal)
+* ==============================================================================
+
+* ------------------------------------------------------------------------------
+* Section 1: USB-C Connector, Cable Impedance & CC Negotiation Network
+* ------------------------------------------------------------------------------
+* USB-C Host 5.0V Supply with cable resistance and contact inductance
+V_HOST VBUS_HOST 0 DC 5.0
+R_CABLE VBUS_HOST VBUS 0.08
+L_CABLE VBUS_HOST VBUS 20n
+
+* USB-C Configuration Channel (CC) Termination
+* Standard Type-C UFP requirement: 5.1k to GND on both CC1 and CC2
+R_CC1 CC1 0 5.1k
+R_CC2 CC2 0 5.1k
+
+* Host CC pull-up resistor model (36k to 5V represents standard 500mA USB-C advertisement)
+R_HOST_CC1 VBUS_HOST CC1 36k
+R_HOST_CC2 VBUS_HOST CC2 36k
+
+* Input Bulk and High-Frequency Bypass Decoupling Capacitors
+C_IN_BULK VBUS 0 10u Rser=0.03
+C_IN_BYPASS VBUS 0 100n Rser=0.01
+
+* ------------------------------------------------------------------------------
+* Section 2: 3.3V LDO Voltage Regulator (AP2112K-3.3 / RT9193-33 for RP2040)
+* ------------------------------------------------------------------------------
+* High-PSRR Low-Dropout Regulator model with 250mV dropout characteristic
+B_LDO VREG_INT 0 V = {IF(V(VBUS) > 3.55, 3.30, MAX(0, V(VBUS) - 0.25))}
+R_LDO_ROUT VREG_INT VCC_3V3 0.04
+C_OUT_3V3 VCC_3V3 0 10u Rser=0.02
+C_BYPASS_3V3 VCC_3V3 0 100n Rser=0.01
+
+* RP2040 Operating Load Current (Core + USB PHY + Clocks ~ 35mA at 3.3V)
+R_RP2040_LOAD VCC_3V3 0 94.3
+
+* ------------------------------------------------------------------------------
+* Section 3: USB 2.0 Full-Speed Data Lines & Damping Resistors
+* ------------------------------------------------------------------------------
+* RP2040 Internal driver impedance is ~18 Ohm; external 27 Ohm resistors make 45 Ohm
+R_TERM_DP USBC_DP RP2040_DP 27
+R_TERM_DM USBC_DM RP2040_DM 27
+
+* Stray PCB and Pin Capacitance
+C_STRAY_DP RP2040_DP 0 8p
+C_STRAY_DM RP2040_DM 0 8p
+
+* Full-Speed 1.5k Pull-up on D+ (internally switched by RP2040 USB PHY during enumeration)
+R_FS_PULLUP VCC_3V3 RP2040_DP 1.5k
+
+* ------------------------------------------------------------------------------
+* Section 4: RP2040 GPIO Output Driving the LR7843 Module
+* ------------------------------------------------------------------------------
+* Simulated 1 kHz PWM waveform from RP2040 GPIO (3.3V amplitude, 50% duty cycle)
+V_RP2040_GPIO GPIO_PIN 0 PULSE(0 3.3 0.5m 20n 20n 0.5m 1.0m)
+
+* ------------------------------------------------------------------------------
+* Section 5: LR7843 MOSFET Module Subsystem
+* ------------------------------------------------------------------------------
+* Terminals on physical module:
+*   PWM+  -> GPIO_PIN
+*   PWM-  -> System Ground (0)
+*   DC+   -> VBUS (5.0V)
+*   DC-   -> System Ground (0)
+*   LOAD+ -> Tied directly to DC+ (VBUS)
+*   LOAD- -> Drain of IRLR7843 MOSFET
+
+* Module Input Resistor & Status Indicator (typically 510 Ohm + internal IR LED)
+R_OPTO_LIMIT GPIO_PIN OPTO_ANODE 510
+
+* Optocoupler PC817 / EL817 Model
+* Opto input IR LED (Vf ~ 1.2V, 4.1mA forward current from 3.3V)
+X_OPTO OPTO_ANODE 0 VBUS FET_GATE_RAW PC817_OPTO
+
+* Gate Pull-Down Resistor (10k on module ensures swift turn-off when opto de-energizes)
+R_GATE_PD FET_GATE_RAW 0 10k
+
+* Series Gate Resistor to MOSFET
+R_GATE_SERIES FET_GATE_RAW FET_GATE 10
+
+* Power MOSFET: Infineon IRLR7843 N-Channel HEXFET (Vds=30V, Rds=3.3mOhm, Vth=1.8V)
+M_LR7843 LOAD_MINUS FET_GATE 0 0 IRLR7843_HEXFET
+
+* ------------------------------------------------------------------------------
+* Section 6: White LED Load Circuit
+* ------------------------------------------------------------------------------
+* White LED connected between LOAD+ (VBUS 5.0V) and LOAD-
+* 100 Ohm ballast resistor limits current to ~16-20 mA with Vf ~ 3.0V
+R_BALLAST VBUS LED_ANODE 100
+D_WHITE_LED LED_ANODE LOAD_MINUS WHITE_LED_MODEL
+
+* ------------------------------------------------------------------------------
+* Component Models & Subcircuits
+* ------------------------------------------------------------------------------
+* PC817 Optocoupler Subcircuit (Transfer Ratio CTR ~ 100%, smooth saturation)
+.subckt PC817_OPTO A K C E
+D_LED A K D_IR_EMITTER
+B_PHOTO C E I = {LIMIT(1.2 * I(D_LED) * TANH(MAX(0, V(C, E)) / 0.15), 0, 25m)}
+C_PHOTO C E 15p
+.model D_IR_EMITTER D(IS=1e-18 N=1.2 RS=2.5 EG=1.42)
+.ends PC817_OPTO
+
+* White High-Brightness LED Model (Vf = 3.05V @ 20mA)
+.model WHITE_LED_MODEL D(IS=1e-22 N=2.85 RS=4.8 EG=3.20)
+
+* Infineon IRLR7843 N-Channel Power MOSFET Model
+.model IRLR7843_HEXFET NMOS(LEVEL=1 VTO=1.80 KP=50 RS=0.0012 RD=0.0021 CGSO=1.8n CGDO=0.7n CBD=1.5n)
+
+* ------------------------------------------------------------------------------
+* Simulation Controls & Directives
+* ------------------------------------------------------------------------------
+.tran 0 3m 0 1u
+
+* Verification Measurements
+.meas tran V_VBUS_STEADY AVG V(VBUS) FROM 1m TO 3m
+.meas tran V_3V3_RAIL AVG V(VCC_3V3) FROM 1m TO 3m
+.meas tran V_CC1_NEGOTIATED AVG V(CC1) FROM 1m TO 3m
+.meas tran V_CC2_NEGOTIATED AVG V(CC2) FROM 1m TO 3m
+.meas tran VGS_HIGH MAX V(FET_GATE) FROM 1m TO 3m
+.meas tran VGS_LOW MIN V(FET_GATE) FROM 1m TO 3m
+.meas tran I_LED_ON MAX I(R_BALLAST) FROM 1m TO 3m
+.meas tran I_LED_OFF MIN I(R_BALLAST) FROM 1m TO 3m
+.meas tran VDS_ON MIN V(LOAD_MINUS) FROM 1m TO 3m
+.meas tran VDS_OFF MAX V(LOAD_MINUS) FROM 1m TO 3m
+.meas tran P_MOSFET_AVG AVG (V(LOAD_MINUS)*Id(M_LR7843)) FROM 1m TO 3m
+
+.end

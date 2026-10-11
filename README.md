@@ -58,6 +58,13 @@ graph TD
 
 ```
 USBCommunicator/
+├── docs/
+│   ├── USB_C_RP2040_LR7843_CIRCUIT_DESIGN.md # Hardware schematic, BOM & simulation guide
+│   └── WINDOWS_STARTUP_GUIDE.md              # Auto-start setup & background service guide
+├── simulation/
+│   ├── usb_rp2040_lr7843.asc                 # Graphical LTspice schematic file
+│   ├── usb_rp2040_lr7843.cir                 # SPICE netlist with device models & measurements
+│   └── verify_circuit.py                     # Automated LTspice simulation & test suite
 ├── host/
 │   ├── teams_detector.py      # Core 100% local Teams status & hardware detection engine
 │   ├── teams_monitor.py       # Standalone Teams monitor CLI & USB serial dispatcher
@@ -68,9 +75,12 @@ USBCommunicator/
 │   ├── boot.py                # Startup script run once on MicroPython boot
 │   ├── main.py                # Main entry point triggering code.py
 │   └── code.py                # Non-blocking serial handler, JSON parser & RGB LED control
+├── build_exe.py               # PyInstaller standalone executable compiler
+├── build_exe.bat              # Batch shortcut to build dist\TeamsMonitor.exe
 ├── connect_mpremote.py        # Python helper to run mpremote from .venv on COM4
 ├── connect_mpremote.bat       # Command Prompt shortcut for mpremote on COM4
-└── connect_mpremote.ps1       # PowerShell shortcut for mpremote on COM4
+├── connect_mpremote.ps1       # PowerShell shortcut for mpremote on COM4
+└── CHANGELOG.md               # Version history and release notes
 ```
 
 ---
@@ -322,10 +332,76 @@ python host/host_communicator.py COM4 -b 115200
 
 ---
 
+## Hardware Circuit: USB-C Powered RP2040 & LR7843 White LED Driver
+
+A companion hardware design enables powering the RP2040 microcontroller and an **LR7843 MOSFET module** directly from a single USB Type-C connector while preserving high-speed bidirectional USB 2.0 communication with the host PC. The LR7843 module switches a simple, bright white LED load using 3.3V GPIO / PWM signals from the RP2040.
+
+### Circuit Diagram
+
+```
+                                      +5.0V (VBUS)
+                                          |
+                          +---------------+-------------------------+
+                          |               |                         |
+                   [CIN: 10uF + 100nF]    |                         |
+                          |          [AP2112K LDO]            [R_BALLAST: 100Ω]
+                         GND              |                         |
+                                     +3.3V Rail                [WHITE LED]
+                                          | (VCC_3V3)               |
+                                          |                    (Anode -> Cathode)
+    +-----------------------+             |                         |
+    | USB-C Receptacle      |             |                         | (LOAD-)
+    |                       |             v                         v
+    | VBUS (A4,A9,B4,B9) ---+----> [RP2040 MCU]              [LR7843 MODULE]
+    | GND  (A1,A12,B1,B12) -+----> GND                       |              |
+    | CC1  (A5) ------------+----> R_CC1: 5.1k -> GND        | DC+  -> 5.0V |
+    | CC2  (B5) ------------+----> R_CC2: 5.1k -> GND        | DC-  -> GND  |
+    | D+   (A6,B6) ---------+----> R_TERM_DP: 27Ω -> USB_DP  | LOAD+ -> 5.0V|
+    | D-   (A7,B7) ---------+----> R_TERM_DM: 27Ω -> USB_DM  | LOAD- -> LED-|
+    | Shield / Case --------+----> GND                       | PWM+ <- GPIO |
+    +-----------------------+                                | PWM- <- GND  |
+                                                             +--------------+
+                                                                    |
+                                                                   GND
+```
+
+### Key Electrical Features
+
+1. **USB-C UFP Power Negotiation**: Dual independent $5.1\,\text{k}\Omega \pm 1\%$ pull-down resistors on `CC1` and `CC2` negotiate 5.0V VBUS from compliant USB-C hosts and chargers.
+2. **USB 2.0 Full-Speed Signal Integrity**: Series $27\,\Omega \pm 1\%$ termination resistors on $D+$ and $D-$ match the RP2040 transceiver to $90\,\Omega$ differential impedance.
+3. **Dual Power Rails**: High-current 5.0V rail feeds the LR7843 / LED load directly; an AP2112K-3.3 LDO (or onboard Pico regulator) powers the RP2040 at 3.3V with ceramic decoupling ($10\,\mu\text{F} + 100\,\text{nF}$).
+4. **Optocoupled Gate Drive**: The LR7843 module's PC817 optocoupler isolates the RP2040 GPIO (drawing only $\approx 4.1\,\text{mA}$) while charging the IRLR7843 MOSFET gate to 4.98V for deep saturation ($R_{DS(on)} = 3.3\,\text{m}\Omega$).
+5. **White LED Driver**: Sized with a $100\,\Omega$ 1/4W ballast resistor for $\approx 15 - 20\,\text{mA}$ forward current at $V_F \approx 3.0\,\text{V}$.
+
+### LTspice Verification
+
+The complete circuit has been validated in **LTspice** (`C:\Program Files\ADI\LTspice\LTspice.exe`):
+* **Schematic File**: [`simulation/usb_rp2040_lr7843.asc`](file:///D:/git/USBCommunicator/simulation/usb_rp2040_lr7843.asc) (open in LTspice GUI to view and probe nodes).
+* **Netlist File**: [`simulation/usb_rp2040_lr7843.cir`](file:///D:/git/USBCommunicator/simulation/usb_rp2040_lr7843.cir) (SPICE models and measurement directives).
+* **Automated Test Runner**: [`simulation/verify_circuit.py`](file:///D:/git/USBCommunicator/simulation/verify_circuit.py).
+
+#### Running Circuit Verification
+```powershell
+python simulation/verify_circuit.py
+```
+
+All 10 electrical checks pass:
+* USB VBUS: **5.0000 V** (Target: 4.75–5.25 V)
+* RP2040 3.3V Rail: **3.2986 V** (Target: 3.20–3.40 V)
+* USB-C CC1 / CC2: **0.6204 V** (Target: 0.25–2.04 V detection window)
+* LR7843 Gate ON: **4.9854 V** | Gate OFF: **-0.58 µV**
+* White LED Current: **15.03 mA** | Off Leakage: **0.11 µA**
+* MOSFET Conduction Power: **3.84 µW** ($V_{DS} \approx -79\,\mu\text{V}$)
+
+For full design theory and Bill of Materials (BOM), see [**`docs/USB_C_RP2040_LR7843_CIRCUIT_DESIGN.md`**](file:///D:/git/USBCommunicator/docs/USB_C_RP2040_LR7843_CIRCUIT_DESIGN.md).
+
+---
+
 ## Troubleshooting
 
 * **Port Busy / Permission Denied**: Close any other applications accessing `COM4` (such as `mpremote`, PuTTY, Thonny, or VSCode Serial Monitor) before launching `teams_monitor.py` or `host_communicator.py`.
 * **No Response / Timeout**: Ensure `boot.py`, `main.py`, and `code.py` have been uploaded to the RP2040 board using `python connect_mpremote.py cp ...` and reset using `python connect_mpremote.py reset`.
 * **Custom Teams Log Location**: If your Teams installation logs to a custom directory, pass `--log-dir "C:\path\to\Logs"`.
 * **Board Hardware Compatibility**: Works with standard Raspberry Pi Pico (onboard single-color LED) and RP2040 boards with WS2812 NeoPixel LEDs (e.g. Waveshare RP2040-Zero, RP2040-Matrix, Adafruit Feather RP2040).
+
 
