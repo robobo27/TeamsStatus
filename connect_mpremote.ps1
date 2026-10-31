@@ -1,1 +1,2 @@
-& "$PSScriptRoot\.venv\Scripts\mpremote.exe" connect COM4 @args
+& "$PSScriptRoot\.venv\Scripts\python.exe" "$PSScriptRoot\connect_mpremote.py" @args
+

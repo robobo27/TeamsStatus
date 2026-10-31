@@ -75,12 +75,13 @@ USBCommunicator/
 │   ├── boot.py                # Startup script run once on MicroPython boot
 │   ├── main.py                # Main entry point triggering code.py
 │   └── code.py                # Non-blocking serial handler, JSON parser & RGB LED control
-├── build_exe.py               # PyInstaller standalone executable compiler
-├── build_exe.bat              # Batch shortcut to build dist\TeamsMonitor.exe
-├── connect_mpremote.py        # Python helper to run mpremote from .venv on COM4
-├── connect_mpremote.bat       # Command Prompt shortcut for mpremote on COM4
-├── connect_mpremote.ps1       # PowerShell shortcut for mpremote on COM4
-└── CHANGELOG.md               # Version history and release notes
+├── build_exe.py                # PyInstaller standalone executable compiler
+├── build_exe.bat               # Batch shortcut to build dist\TeamsMonitor.exe
+├── flash_and_deploy_rp2040.py  # Automated BOOTSEL UF2 flasher, port scanner & script deployer
+├── connect_mpremote.py         # Python helper to run mpremote with RP2040 port auto-discovery
+├── connect_mpremote.bat        # Command Prompt shortcut for mpremote with auto-discovery
+├── connect_mpremote.ps1        # PowerShell shortcut for mpremote with auto-discovery
+└── CHANGELOG.md                # Version history and release notes
 ```
 
 ---
@@ -249,8 +250,21 @@ sequenceDiagram
 pip install -r host/requirements.txt
 ```
 
-### 2. Upload Code to the RP2040 Board
-Use the workspace connection helper scripts to copy board scripts to the RP2040 and soft-reset:
+### 2. Provision & Upload Code to the RP2040 Board
+
+#### Option A: Automated One-Step Provisioning & Deployment (Recommended)
+Whether your RP2040 is brand new in factory **BOOTSEL mode** (mounted as a removable drive `RPI-RP2` with no COM port yet) or already running MicroPython, run [`flash_and_deploy_rp2040.py`](file:///D:/Git/USBCommunicator/flash_and_deploy_rp2040.py):
+```powershell
+python flash_and_deploy_rp2040.py
+```
+What this script does automatically:
+1. **Detects BOOTSEL Drive (`RPI-RP2`)**: If the board is in UF2 bootloader mode, it downloads the latest official MicroPython `.uf2` firmware for the **Waveshare RP2040-Zero** (or `--board pico` / custom `--uf2 <path>`), flashes it to the `RPI-RP2` drive, and waits for the board to reboot.
+2. **Auto-Discovers the COM Port**: Scans active USB serial devices for RP2040 hardware Vendor IDs (`0x2E8A`, `0x239A`, `0x1B4F`)—no need to guess whether Windows assigned `COM3` or `COM4`.
+3. **Deploys Scripts via `mpremote`**: Copies [`rp2040/boot.py`](file:///D:/Git/USBCommunicator/rp2040/boot.py), [`rp2040/code.py`](file:///D:/Git/USBCommunicator/rp2040/code.py), and [`rp2040/main.py`](file:///D:/Git/USBCommunicator/rp2040/main.py) to the board's root filesystem, verifies `fs ls`, and soft-resets the microcontroller.
+4. **Verifies Live Serial Link**: Sends a `ping` at `115200` baud and confirms the `Hello World! RP2040 received: 'ping'` response.
+
+#### Option B: Manual `mpremote` File Upload
+[`connect_mpremote.py`](file:///D:/Git/USBCommunicator/connect_mpremote.py) automatically discovers the connected RP2040 COM port (or accepts an explicit `connect COMx`):
 ```powershell
 python connect_mpremote.py cp rp2040/boot.py :boot.py
 python connect_mpremote.py cp rp2040/code.py :code.py
@@ -259,9 +273,9 @@ python connect_mpremote.py reset
 ```
 
 ### 3. Run the Standalone Teams Status Monitor
-Run in full mode (monitors Teams and sends updates to the RP2040 over `COM4`):
+Run in full mode (monitors Teams and auto-discovers the RP2040 COM port, or pass `--port COM3` / `--port COM4`):
 ```powershell
-python host/teams_monitor.py --port COM4
+python host/teams_monitor.py
 ```
 
 Or run in console-only standalone mode (without serial connection):
@@ -327,7 +341,7 @@ python host/host_communicator.py
 ```
 Or specify a custom COM port:
 ```powershell
-python host/host_communicator.py COM4 -b 115200
+python host/host_communicator.py COM3 -b 115200
 ```
 
 ---
@@ -399,9 +413,11 @@ For full design theory and Bill of Materials (BOM), see [**`docs/USB_C_RP2040_LR
 
 ## Troubleshooting
 
-* **Port Busy / Permission Denied**: Close any other applications accessing `COM4` (such as `mpremote`, PuTTY, Thonny, or VSCode Serial Monitor) before launching `teams_monitor.py` or `host_communicator.py`.
-* **No Response / Timeout**: Ensure `boot.py`, `main.py`, and `code.py` have been uploaded to the RP2040 board using `python connect_mpremote.py cp ...` and reset using `python connect_mpremote.py reset`.
+* **Board Shows Up as `RPI-RP2` Drive Instead of a COM Port**: Brand-new RP2040 boards (or boards connected while holding the `BOOTSEL` button) start in the factory ROM UF2 bootloader (`RPI-RP2` USB mass storage drive) and do not expose a serial COM port until MicroPython firmware (`.uf2`) is flashed. Run `python flash_and_deploy_rp2040.py` to automatically download the Waveshare RP2040-Zero MicroPython firmware, flash the `RPI-RP2` drive, wait for USB CDC serial enumeration, upload `rp2040/*.py`, and verify communication.
+* **Port Busy / Permission Denied**: Close any other applications accessing the RP2040 COM port (such as `mpremote`, PuTTY, Thonny, or VSCode Serial Monitor) before launching `teams_monitor.py` or `host_communicator.py`.
+* **No Response / Timeout**: Ensure `boot.py`, `main.py`, and `code.py` have been uploaded to the RP2040 board using `python flash_and_deploy_rp2040.py` (or `python connect_mpremote.py cp ...` and `python connect_mpremote.py reset`).
 * **Custom Teams Log Location**: If your Teams installation logs to a custom directory, pass `--log-dir "C:\path\to\Logs"`.
 * **Board Hardware Compatibility**: Works with standard Raspberry Pi Pico (onboard single-color LED) and RP2040 boards with WS2812 NeoPixel LEDs (e.g. Waveshare RP2040-Zero, RP2040-Matrix, Adafruit Feather RP2040).
+
 
 

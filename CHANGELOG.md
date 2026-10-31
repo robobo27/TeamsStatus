@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.4.0] - 2026-10-31
+
+### Added
+- **Automated RP2040 Provisioning & Deployment Script**:
+  - Created [`flash_and_deploy_rp2040.py`](file:///D:/Git/USBCommunicator/flash_and_deploy_rp2040.py) to automate onboarding brand-new RP2040 boards in factory `BOOTSEL` mode (`RPI-RP2` USB drive) as well as updating existing boards.
+  - Automatically resolves and downloads the latest official MicroPython `.uf2` firmware for `WAVESHARE_RP2040_ZERO` (or `RPI_PICO`), flashes the `RPI-RP2` drive, waits for USB CDC serial enumeration, deploys [`rp2040/boot.py`](file:///D:/Git/USBCommunicator/rp2040/boot.py), [`rp2040/code.py`](file:///D:/Git/USBCommunicator/rp2040/code.py), and [`rp2040/main.py`](file:///D:/Git/USBCommunicator/rp2040/main.py) via `mpremote`, soft-resets the board, and verifies live serial communication at `115200` baud.
+- **Agent Workspace Customizations (Rule & Skill)**:
+  - Added [`AGENTS.md`](file:///D:/Git/USBCommunicator/AGENTS.md) workspace rule documenting repository architecture, `.venv` tooling paths, Waveshare RP2040-Zero hardware specifics, and COM port lock awareness.
+  - Added [`.agents/skills/rp2040-zero-workflow/SKILL.md`](file:///D:/Git/USBCommunicator/.agents/skills/rp2040-zero-workflow/SKILL.md) on-demand skill with an operational runbook for diagnosing `BOOTSEL` (`RPI-RP2`) vs. COM port enumeration, avoiding `PermissionError` port contention, deploying scripts, and testing WS2812 RGB LED status payloads.
+
+### Changed
+- **Automatic COM Port Discovery in `connect_mpremote`**:
+  - Updated [`connect_mpremote.py`](file:///D:/Git/USBCommunicator/connect_mpremote.py), [`connect_mpremote.bat`](file:///D:/Git/USBCommunicator/connect_mpremote.bat), and [`connect_mpremote.ps1`](file:///D:/Git/USBCommunicator/connect_mpremote.ps1) to auto-detect the connected RP2040 COM port via USB Vendor ID (`0x2E8A`, `0x239A`, `0x1B4F`) instead of hardcoding `COM4`.
+- **Documentation**:
+  - Updated [`README.md`](file:///D:/Git/USBCommunicator/README.md) with `BOOTSEL` firmware flashing instructions, automated deployment usage, and troubleshooting guidance when an RP2040 mounts as an `RPI-RP2` drive without a COM port.
+
+---
+
 ## [1.3.0] - 2026-10-10
 
 ### Added
