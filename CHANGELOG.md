@@ -1,9 +1,36 @@
 # Changelog
 
-All notable changes to the **USB Communicator** project are documented in this file.
+All notable changes to the **TeamsStatus** project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [1.5.0] - 2026-11-02
+
+### Added
+- **External "On Air" LED Strip PWM Driver (`GPIO 15`)**:
+  - Updated [`UnifiedLED`](file:///D:/Git/USBCommunicator/rp2040/code.py#L52-L211) in [`rp2040/code.py`](file:///D:/Git/USBCommunicator/rp2040/code.py) to initialize a `1000 Hz` hardware PWM output on `GPIO 15` (`Right Pin 8` on the Waveshare RP2040-Zero) for driving the external `LR7843` / `D4184` MOSFET module alongside the onboard WS2812 RGB NeoPixel (`GPIO 16`).
+  - Implemented **"On Air" Call & Busy** lighting behavior:
+    - `InACall` / `InAMeeting` / `DoNotDisturb`: Solid **100% ON** (`PWM_DUTY_FULL = 65535`).
+    - `Busy`: Smooth **10%–30% pulsing** (`PWM_DUTY_PULSE_LOW = 6554` $\leftrightarrow$ `PWM_DUTY_PULSE_HIGH = 19661` every `600 ms`, paired with onboard NeoPixel Red pulsing `(12, 0, 0) <-> (48, 0, 0)`).
+    - `Available` / `Away` / `BeRightBack` / `Offline` / `NotRunning` / `Unknown`: **OFF** (`0%`, `PWM_DUTY_OFF = 0`).
+- **5 V 18-LED White Strip & `D4184` (`HW-532`) Hardware Design + Direct-Drive Guide**:
+  - Updated [`docs/USB_C_RP2040_LR7843_CIRCUIT_DESIGN.md`](file:///D:/Git/USBCommunicator/docs/USB_C_RP2040_LR7843_CIRCUIT_DESIGN.md) to model the **18-LED white strip** ($6 \times 150\,\Omega$ parallel segments + onboard `M7` / `1N4007` series input diode, $I_{\text{strip}} = 53.13\,\text{mA}$ at $5.0\,\text{V}$), added a side-by-side comparison of the `LR7843` vs. `D4184` (`AOD4184A` + `EL817`) MOSFET trigger modules ([`docs/Screenshot_31-10-2026_94314_www.aliexpress.us.jpeg`](file:///D:/Git/USBCommunicator/docs/Screenshot_31-10-2026_94314_www.aliexpress.us.jpeg)), and simplified the wiring specification to a 5-wire module-to-module interconnect ($0$ external passive components required).
+  - Added [`docs/USB_C_RP2040_LR7843_LED_STRIP_DESIGN.md`](file:///D:/Git/USBCommunicator/docs/USB_C_RP2040_LR7843_LED_STRIP_DESIGN.md) documenting an alternative direct-GPIO drive configuration (bypassing the series `M7` diode to run the LED strip at reduced brightness directly from `GP15` at $3.3\,\text{V}$ without the MOSFET module).
+  - Updated [`simulation/usb_rp2040_lr7843.cir`](file:///D:/Git/USBCommunicator/simulation/usb_rp2040_lr7843.cir), [`simulation/usb_rp2040_lr7843.asc`](file:///D:/Git/USBCommunicator/simulation/usb_rp2040_lr7843.asc), and [`simulation/verify_circuit.py`](file:///D:/Git/USBCommunicator/simulation/verify_circuit.py) to simulate the 6-branch $150\,\Omega$ LED strip and series `M7` diode across all 10 automated LTspice verification checks.
+
+### Fixed
+- **Intermittent 10–30s Teams Presence Detection Lag**:
+  - Fixed [`TeamsLogTailer._read_incremental()`](file:///D:/Git/USBCommunicator/host/teams_detector.py#L517-L561) in [`host/teams_detector.py`](file:///D:/Git/USBCommunicator/host/teams_detector.py) to read in binary mode and advance `self.file_pos` only up to the last complete newline (`\n`), preventing status lines split across `ms-teams.exe`'s 8 KB C++ stdio flush boundaries from being truncated and dropped.
+  - Added [`BADGE_STATUS_PATTERN`](file:///D:/Git/USBCommunicator/host/teams_detector.py#L368-L371) (`ShowBadge` / `SetBadge` / `Setting badge ..., status <Status>`) and [`CLOUD_STATE_PATTERN`](file:///D:/Git/USBCommunicator/host/teams_detector.py#L361-L364) (`UserDataCloudState`) to capture the very first log line emitted during a Teams presence change, and updated [`normalize_status()`](file:///D:/Git/USBCommunicator/host/teams_detector.py#L82-L95) to normalize space/hyphen-separated status strings (`"Do not disturb"`, `"Be right back"`).
+  - Reduced the default host polling interval in [`host/teams_monitor.py`](file:///D:/Git/USBCommunicator/host/teams_monitor.py) from `1.0s` to `0.5s`.
+  - Added [`test_log_tailer_partial_line_and_badge_parsing`](file:///D:/Git/USBCommunicator/host/test_teams_detector.py#L79-L110) unit test in [`host/test_teams_detector.py`](file:///D:/Git/USBCommunicator/host/test_teams_detector.py).
+
+### Changed
+- **Repository Rename to `TeamsStatus`**:
+  - Renamed project references from `USBCommunicator` to `TeamsStatus` across [`README.md`](file:///D:/Git/USBCommunicator/README.md), [`AGENTS.md`](file:///D:/Git/USBCommunicator/AGENTS.md), [`.agents/skills/rp2040-zero-workflow/SKILL.md`](file:///D:/Git/USBCommunicator/.agents/skills/rp2040-zero-workflow/SKILL.md), [`docs/WINDOWS_STARTUP_GUIDE.md`](file:///D:/Git/USBCommunicator/docs/WINDOWS_STARTUP_GUIDE.md), [`flash_and_deploy_rp2040.py`](file:///D:/Git/USBCommunicator/flash_and_deploy_rp2040.py), and [`host/teams_monitor.py`](file:///D:/Git/USBCommunicator/host/teams_monitor.py) (`STARTUP_APP_NAME = "TeamsStatus_TeamsMonitor"`).
 
 ---
 
