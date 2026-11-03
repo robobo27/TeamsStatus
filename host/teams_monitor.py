@@ -43,7 +43,7 @@ except ImportError:
 
 # Windows Registry autorun key
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-STARTUP_APP_NAME = "USBCommunicator_TeamsMonitor"
+STARTUP_APP_NAME = "TeamsStatus_TeamsMonitor"
 
 
 class NullWriter:
@@ -371,8 +371,8 @@ def main():
         "-i",
         "--interval",
         type=float,
-        default=1.0,
-        help="Polling interval in seconds (default: 1.0)",
+        default=0.5,
+        help="Polling interval in seconds (default: 0.5)",
     )
     parser.add_argument(
         "-H",

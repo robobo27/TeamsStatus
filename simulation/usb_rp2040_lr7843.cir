@@ -1,5 +1,5 @@
 * ==============================================================================
-* Circuit: USB-C Powered RP2040 Microcontroller and LR7843 MOSFET LED Driver
+* Circuit: USB-C Powered RP2040 Microcontroller and D4184/LR7843 MOSFET LED Driver
 * Tool: LTspice 26.x / XVII (Analog Devices)
 * File: usb_rp2040_lr7843.cir
 * ==============================================================================
@@ -8,9 +8,11 @@
 *   - CC1 / CC2: 5.1k Ohm pull-downs for USB-C UFP (Device) power negotiation
 *   - Power: 5V VBUS stepped down to 3.3V via LDO (AP2112K-3.3) for RP2040
 *   - USB Data: D+ and D- terminated with 27 Ohm resistors to RP2040 USB transceiver
-*   - RP2040 GPIO: Drives PWM control signal (3.3V logic) to LR7843 module
-*   - LR7843 Module: Optocoupler (PC817) isolation driving IRLR7843 N-MOSFET gate
-*   - Load: White LED (Vf approx 3.0V) with 100 Ohm ballast resistor (20mA nominal)
+*   - RP2040 GPIO: Drives PWM control signal (3.3V logic) to D4184/LR7843 module
+*   - D4184 (HW-532) Module: EL817 (817) optocoupler with 1k (102) input resistor,
+*     dual 4.7k (472) gate divider, 100R (101) gate stopper, 12V Zener clamp,
+*     onboard status LED + 4.7k (472), driving AOD4184A (D4184) N-MOSFET
+*   - Load: White LED (Vf approx 3.0V) with 100 Ohm ballast resistor (15-20mA nominal)
 * ==============================================================================
 
 * ------------------------------------------------------------------------------
@@ -61,62 +63,98 @@ C_STRAY_DM RP2040_DM 0 8p
 R_FS_PULLUP VCC_3V3 RP2040_DP 1.5k
 
 * ------------------------------------------------------------------------------
-* Section 4: RP2040 GPIO Output Driving the LR7843 Module
+* Section 4: RP2040 GPIO Output Driving the D4184 / LR7843 Module
 * ------------------------------------------------------------------------------
 * Simulated 1 kHz PWM waveform from RP2040 GPIO (3.3V amplitude, 50% duty cycle)
 V_RP2040_GPIO GPIO_PIN 0 PULSE(0 3.3 0.5m 20n 20n 0.5m 1.0m)
 
 * ------------------------------------------------------------------------------
-* Section 5: LR7843 MOSFET Module Subsystem
+* Section 5: Physical D4184 (AOD4184A) / LR7843 Optocoupled MOSFET Module (HW-532)
 * ------------------------------------------------------------------------------
 * Terminals on physical module:
-*   PWM+  -> GPIO_PIN
-*   PWM-  -> System Ground (0)
-*   DC+   -> VBUS (5.0V)
-*   DC-   -> System Ground (0)
-*   LOAD+ -> Tied directly to DC+ (VBUS)
-*   LOAD- -> Drain of IRLR7843 MOSFET
+*   Control End (2 pads):
+*     PWM   -> GPIO_PIN
+*     GND   -> System Ground (0)
+*   Load End (3 pads):
+*     +     -> VBUS (5.0V) AND External White LED Anode (+)
+*     LOAD  -> Drain of D4184 MOSFET (LOAD_MINUS)
+*     -     -> System Ground (0)
 
-* Module Input Resistor & Status Indicator (typically 510 Ohm + internal IR LED)
-R_OPTO_LIMIT GPIO_PIN OPTO_ANODE 510
+* Module Input Resistor: SMD code '102' (1.0k Ohm) in series with EL817 IR LED
+R_OPTO_LIMIT GPIO_PIN OPTO_ANODE 1k
 
-* Optocoupler PC817 / EL817 Model
-* Opto input IR LED (Vf ~ 1.2V, 4.1mA forward current from 3.3V)
-X_OPTO OPTO_ANODE 0 VBUS FET_GATE_RAW PC817_OPTO
+* Optocoupler EL817 / PC817 ('817 C719')
+* Opto input IR LED (Vf ~ 1.2V, If = (3.3V - 1.2V)/1k = 2.1mA from 3.3V GPIO)
+R_COLLECTOR VBUS OPTO_COLL 4.7k
+X_OPTO OPTO_ANODE 0 OPTO_COLL FET_GATE_RAW PC817_OPTO
 
-* Gate Pull-Down Resistor (10k on module ensures swift turn-off when opto de-energizes)
-R_GATE_PD FET_GATE_RAW 0 10k
+* Gate Pull-Down Resistor: SMD code '472' (4.7k Ohm; forms 50% divider with R_COLLECTOR)
+R_GATE_PD FET_GATE_RAW 0 4.7k
 
-* Series Gate Resistor to MOSFET
-R_GATE_SERIES FET_GATE_RAW FET_GATE 10
+* Gate Protection Zener Diode (12V MELF glass Zener across Gate-Source)
+D_GATE_ZENER 0 FET_GATE_RAW ZENER_12V
 
-* Power MOSFET: Infineon IRLR7843 N-Channel HEXFET (Vds=30V, Rds=3.3mOhm, Vth=1.8V)
-M_LR7843 LOAD_MINUS FET_GATE 0 0 IRLR7843_HEXFET
+* Series Gate Stopper Resistor: SMD code '101' (100 Ohm) to MOSFET Gate
+R_GATE_SERIES FET_GATE_RAW FET_GATE 100
+
+* Onboard Status Indicator LED + SMD code '472' (4.7k Ohm) across '+' (VBUS) and 'LOAD'
+R_ONBOARD_LED VBUS ONBOARD_LED_A 4.7k
+D_ONBOARD_LED ONBOARD_LED_A LOAD_MINUS STATUS_LED_MODEL
+
+* Power MOSFET: Alpha & Omega AOD4184A ('D4184', Vds=40V, Rds(on)=8.5mOhm, Vth=2.1V)
+M_LR7843 LOAD_MINUS FET_GATE 0 0 AOD4184A_MOSFET
 
 * ------------------------------------------------------------------------------
-* Section 6: White LED Load Circuit
+* Section 6: 18-LED White Strip Load Circuit (M7 Series Diode + 6x 150R Segments)
 * ------------------------------------------------------------------------------
-* White LED connected between LOAD+ (VBUS 5.0V) and LOAD-
-* 100 Ohm ballast resistor limits current to ~16-20 mA with Vf ~ 3.0V
-R_BALLAST VBUS LED_ANODE 100
-D_WHITE_LED LED_ANODE LOAD_MINUS WHITE_LED_MODEL
+* M7 (1N4007) SMD rectifier diode wired in series with the positive LED strip terminal
+D_M7 VBUS STRIP_PLUS M7_1N4007_MODEL
+
+* 6 Parallel Segments (Segments 1..6), each with a 150 Ohm ('151') resistor
+* and 3 parallel White LEDs (6 x 3 = 18 LEDs total; Req = 150 / 6 = 25 Ohm)
+R_SEG1 STRIP_PLUS SEG1_A 150
+D_LED1 SEG1_A LOAD_MINUS WHITE_LED_3X_MODEL
+
+R_SEG2 STRIP_PLUS SEG2_A 150
+D_LED2 SEG2_A LOAD_MINUS WHITE_LED_3X_MODEL
+
+R_SEG3 STRIP_PLUS SEG3_A 150
+D_LED3 SEG3_A LOAD_MINUS WHITE_LED_3X_MODEL
+
+R_SEG4 STRIP_PLUS SEG4_A 150
+D_LED4 SEG4_A LOAD_MINUS WHITE_LED_3X_MODEL
+
+R_SEG5 STRIP_PLUS SEG5_A 150
+D_LED5 SEG5_A LOAD_MINUS WHITE_LED_3X_MODEL
+
+R_SEG6 STRIP_PLUS SEG6_A 150
+D_LED6 SEG6_A LOAD_MINUS WHITE_LED_3X_MODEL
 
 * ------------------------------------------------------------------------------
 * Component Models & Subcircuits
 * ------------------------------------------------------------------------------
-* PC817 Optocoupler Subcircuit (Transfer Ratio CTR ~ 100%, smooth saturation)
+* PC817 / EL817 Optocoupler Subcircuit (Transfer Ratio CTR ~ 120%, smooth saturation)
 .subckt PC817_OPTO A K C E
 D_LED A K D_IR_EMITTER
-B_PHOTO C E I = {LIMIT(1.2 * I(D_LED) * TANH(MAX(0, V(C, E)) / 0.15), 0, 25m)}
+B_PHOTO C E I = {LIMIT(1.2 * I(D_LED) * TANH(MAX(0, V(C, E)) / 0.08), 0, 25m)}
 C_PHOTO C E 15p
 .model D_IR_EMITTER D(IS=1e-18 N=1.2 RS=2.5 EG=1.42)
 .ends PC817_OPTO
 
-* White High-Brightness LED Model (Vf = 3.05V @ 20mA)
-.model WHITE_LED_MODEL D(IS=1e-22 N=2.85 RS=4.8 EG=3.20)
+* 12V Gate Protection Zener Diode Model
+.model ZENER_12V D(IS=1e-14 N=1.0 BV=12.0 IBV=1m RS=2.0)
 
-* Infineon IRLR7843 N-Channel Power MOSFET Model
-.model IRLR7843_HEXFET NMOS(LEVEL=1 VTO=1.80 KP=50 RS=0.0012 RD=0.0021 CGSO=1.8n CGDO=0.7n CBD=1.5n)
+* Onboard SMD Status Indicator LED Model (Vf ~ 2.0V)
+.model STATUS_LED_MODEL D(IS=1e-19 N=2.0 RS=4.0 EG=2.10)
+
+* M7 (1N4007) Silicon Rectifier Diode Model (1000V, 1A, Vf ~ 0.78V @ 50mA)
+.model M7_1N4007_MODEL D(IS=7.02e-9 N=1.77 RS=0.042 BV=1000 IBV=5u CJO=26p TT=4.32u)
+
+* 3 Parallel White SMD LEDs per Segment (IS=3x single LED, RS=1/3 single LED)
+.model WHITE_LED_3X_MODEL D(IS=3e-22 N=2.85 RS=1.6 EG=3.20)
+
+* Alpha & Omega AOD4184A ('D4184') N-Channel Power MOSFET Model (Vds=40V, Rds=8.5mOhm, Vth=2.1V)
+.model AOD4184A_MOSFET NMOS(LEVEL=1 VTO=2.10 KP=35 RS=0.0030 RD=0.0055 CGSO=1.4n CGDO=0.4n CBD=1.2n)
 
 * ------------------------------------------------------------------------------
 * Simulation Controls & Directives
@@ -130,8 +168,9 @@ C_PHOTO C E 15p
 .meas tran V_CC2_NEGOTIATED AVG V(CC2) FROM 1m TO 3m
 .meas tran VGS_HIGH MAX V(FET_GATE) FROM 1m TO 3m
 .meas tran VGS_LOW MIN V(FET_GATE) FROM 1m TO 3m
-.meas tran I_LED_ON MAX I(R_BALLAST) FROM 1m TO 3m
-.meas tran I_LED_OFF MIN I(R_BALLAST) FROM 1m TO 3m
+.meas tran V_STRIP_PLUS_ON MAX V(STRIP_PLUS) FROM 1m TO 3m
+.meas tran I_LED_ON MAX I(D_M7) FROM 1m TO 3m
+.meas tran I_LED_OFF MIN I(D_M7) FROM 1m TO 3m
 .meas tran VDS_ON MIN V(LOAD_MINUS) FROM 1m TO 3m
 .meas tran VDS_OFF MAX V(LOAD_MINUS) FROM 1m TO 3m
 .meas tran P_MOSFET_AVG AVG (V(LOAD_MINUS)*Id(M_LR7843)) FROM 1m TO 3m

@@ -67,14 +67,49 @@ class TestTeamsDetector(unittest.TestCase):
         self.assertEqual(normalize_status("Available"), TeamsAvailability.AVAILABLE)
         self.assertEqual(normalize_status("busy"), TeamsAvailability.BUSY)
         self.assertEqual(normalize_status("DoNotDisturb"), TeamsAvailability.DO_NOT_DISTURB)
+        self.assertEqual(normalize_status("Do not disturb"), TeamsAvailability.DO_NOT_DISTURB)
         self.assertEqual(normalize_status("dnd"), TeamsAvailability.DO_NOT_DISTURB)
         self.assertEqual(normalize_status("Focusing"), TeamsAvailability.DO_NOT_DISTURB)
         self.assertEqual(normalize_status("Presenting"), TeamsAvailability.DO_NOT_DISTURB)
         self.assertEqual(normalize_status("BeRightBack"), TeamsAvailability.BE_RIGHT_BACK)
+        self.assertEqual(normalize_status("Be right back"), TeamsAvailability.BE_RIGHT_BACK)
         self.assertEqual(normalize_status("away"), TeamsAvailability.AWAY)
         self.assertEqual(normalize_status("Offline"), TeamsAvailability.OFFLINE)
         self.assertEqual(normalize_status("PresenceUnknown"), TeamsAvailability.UNKNOWN)
         self.assertEqual(normalize_status("UnknownRandom"), TeamsAvailability.UNKNOWN)
+
+    def test_log_tailer_partial_line_and_badge_parsing(self):
+        """
+        Verifies that:
+          1. TaskbarModule ShowBadge / SetBadge lines (including multi-word 'Do not disturb') are parsed.
+          2. Partial lines flushed mid-word without a trailing newline (due to Teams' 8 KB stdio buffer)
+             are held until the remainder of the line and newline are flushed.
+        """
+        log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(
+                "2026-08-19T10:00:00.000 <DBG> native_modules::TaskbarModule: "
+                "ShowBadge New Badge:NumericBadge{0}, overlay: 0 items, status Do not disturb\n"
+            )
+
+        tailer = TeamsLogTailer(log_dir=self.test_dir)
+        self.assertEqual(tailer.poll()[0], TeamsAvailability.DO_NOT_DISTURB)
+
+        # Simulate an 8 KB buffer flush that cuts a UserPresenceAction line in half (no trailing newline)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(
+                "2026-08-19T10:01:00.000 <INFO> native_modules::UserDataCrossCloudModule: "
+                "Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availa"
+            )
+
+        # Polling while the line is incomplete must keep the previous status and not advance past the fragment
+        self.assertEqual(tailer.poll()[0], TeamsAvailability.DO_NOT_DISTURB)
+
+        # Now flush the rest of the split line with a newline
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write("bility: BeRightBack}\n")
+
+        self.assertEqual(tailer.poll()[0], TeamsAvailability.BE_RIGHT_BACK)
 
     def test_log_tailer_initial_read(self):
         """

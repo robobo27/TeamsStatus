@@ -1,5 +1,5 @@
 # Python
-__pycache__/
+*__pycache__/
 *.py[cod]
 *$py.class
 
@@ -30,8 +30,9 @@ dist/
 *.log
 scratch/
 
-# LTspice simulation outputs
+# LTspice simulation outputs & Firmware binaries
 *.raw
 *.op.raw
 *.db
 simulation/*.net
+*.uf2

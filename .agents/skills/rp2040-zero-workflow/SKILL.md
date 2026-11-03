@@ -3,11 +3,11 @@ name: rp2040-zero-workflow
 description: >-
   Operational runbook for provisioning, flashing, deploying code, debugging USB serial COM ports,
   controlling the WS2812 RGB LED, and managing the Teams Status Monitor on the Waveshare RP2040-Zero
-  in the USBCommunicator repository. Use this skill whenever interacting with the RP2040 hardware,
+  in the TeamsStatus repository. Use this skill whenever interacting with the RP2040 hardware,
   troubleshooting BOOTSEL (RPI-RP2) or COM port issues, updating rp2040/*.py scripts, or testing serial telemetry.
 ---
 
-# Waveshare RP2040-Zero & USBCommunicator Hardware Runbook
+# Waveshare RP2040-Zero & TeamsStatus Hardware Runbook
 
 ## 1. Diagnosing Hardware State (`BOOTSEL` Drive vs. USB CDC Serial Port)
 

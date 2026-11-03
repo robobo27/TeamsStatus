@@ -18,7 +18,7 @@ There are two primary locations for Run keys:
 
 For the **USB Communicator Teams Monitor**, the per-user hive (**`HKCU`**) is used:
 * **Target Key**: `Software\Microsoft\Windows\CurrentVersion\Run`
-* **Value Name**: `USBCommunicator_TeamsMonitor` (the unique identifier for this application)
+* **Value Name**: `TeamsStatus_TeamsMonitor` (the unique identifier for this application)
 * **Value Type**: `REG_SZ` (Null-terminated UTF-16 string)
 * **Value Data**: The command line string to execute, including quotes and flags (e.g., `"D:\Git\USBCommunicator\dist\TeamsMonitor.exe" --port auto`).
 
@@ -39,7 +39,7 @@ sequenceDiagram
     Winlogon->>Hive: Mount user profile into HKEY_CURRENT_USER
     Winlogon->>Explorer: Launch Windows Explorer (Interactive Session)
     Explorer->>Hive: Read "Software\Microsoft\Windows\CurrentVersion\Run"
-    Hive-->>Explorer: Return registered commands (including "USBCommunicator_TeamsMonitor")
+    Hive-->>Explorer: Return registered commands (including "TeamsStatus_TeamsMonitor")
     Explorer->>App: Spawn process: TeamsMonitor.exe --port auto (Detached / Windowless)
     App->>App: Initialize USB serial connection & begin background monitoring
 ```
@@ -56,7 +56,7 @@ sequenceDiagram
 ### 1.3 Windows Task Manager Integration
 
 Windows Task Manager reads the `Run` keys directly to populate the **Startup apps** tab:
-* **Name**: Identified by the Registry value name (`USBCommunicator_TeamsMonitor`) or file metadata (`FileDescription` / executable name `TeamsMonitor.exe`).
+* **Name**: Identified by the Registry value name (`TeamsStatus_TeamsMonitor`) or file metadata (`FileDescription` / executable name `TeamsMonitor.exe`).
 * **Publisher / Status**: Displays whether the app is currently **Enabled** or **Disabled**.
 * **Startup Impact**: Measured dynamically by Windows based on disk I/O and CPU utilization during login.
 
@@ -84,7 +84,7 @@ import winreg
 
 # Target registry autorun path and unique application key
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-STARTUP_APP_NAME = "USBCommunicator_TeamsMonitor"
+STARTUP_APP_NAME = "TeamsStatus_TeamsMonitor"
 ```
 
 ---
@@ -317,13 +317,13 @@ python host/teams_monitor.py --uninstall-startup
 
 ### 4.1 PowerShell Registry Query
 ```powershell
-Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "USBCommunicator_TeamsMonitor"
+Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "TeamsStatus_TeamsMonitor"
 ```
 
 ### 4.2 Command Prompt Query
 ```cmd
-reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v USBCommunicator_TeamsMonitor
+reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v TeamsStatus_TeamsMonitor
 ```
 
 ### 4.3 Task Manager
-Open **Task Manager** (`Ctrl + Shift + Esc`) -> Select **Startup apps** tab -> Locate **`USBCommunicator_TeamsMonitor`** or **`TeamsMonitor`**.
+Open **Task Manager** (`Ctrl + Shift + Esc`) -> Select **Startup apps** tab -> Locate **`TeamsStatus_TeamsMonitor`** or **`TeamsMonitor`**.

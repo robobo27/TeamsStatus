@@ -100,7 +100,7 @@ def resolve_latest_uf2_url(board_slug: str) -> str:
     """
     page_url = f"https://micropython.org/download/{board_slug}/"
     try:
-        req = urllib.request.Request(page_url, headers={"User-Agent": "USBCommunicator-Deployer/1.0"})
+        req = urllib.request.Request(page_url, headers={"User-Agent": "TeamsStatus-Deployer/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
         # Match stable release UF2 links (excluding '-preview')

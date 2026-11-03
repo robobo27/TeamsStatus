@@ -91,31 +91,31 @@ def verify_specifications(meas):
             "desc": "Type-C UFP 5.1k pull-down valid detection window"
         },
         {
-            "name": "LR7843 Gate ON Voltage (Vgs High)",
+            "name": "D4184/LR7843 Gate ON Voltage (Vgs)",
             "key": "vgs_high",
             "val": meas.get("vgs_high"),
             "unit": "V",
-            "min": 4.50,
+            "min": 2.20,
             "max": 5.10,
-            "desc": "Optocoupler successfully charges gate to ~5V"
+            "desc": "Optocoupler 4.7k/4.7k divider charges gate (~2.49V stock, ~4.95V bridged)"
         },
         {
-            "name": "LR7843 Gate OFF Voltage (Vgs Low)",
+            "name": "D4184/LR7843 Gate OFF Voltage (Vgs)",
             "key": "vgs_low",
             "val": meas.get("vgs_low"),
             "unit": "V",
             "min": -0.10,
             "max": 0.50,
-            "desc": "Pull-down ensures MOSFET fully cut off (< Vth=1.8V)"
+            "desc": "4.7k pull-down ensures MOSFET fully cut off (< Vth=2.1V)"
         },
         {
-            "name": "White LED ON Current",
+            "name": "18-LED Strip ON Current (via M7)",
             "key": "i_led_on",
             "val": meas.get("i_led_on"),
             "unit": "A",
-            "min": 0.010,
-            "max": 0.025,
-            "desc": "Nominal 15-20 mA current for bright white LED illumination"
+            "min": 0.035,
+            "max": 0.065,
+            "desc": "Nominal ~45-55 mA total current for 18-LED strip (6x 150R + M7 diode)"
         },
         {
             "name": "White LED OFF Leakage Current",
@@ -127,16 +127,16 @@ def verify_specifications(meas):
             "desc": "Dark off-state leakage < 10 uA"
         },
         {
-            "name": "LR7843 Saturation Voltage (Vds ON)",
+            "name": "D4184/LR7843 On-State Drop (Vds ON)",
             "key": "vds_on",
             "val": meas.get("vds_on"),
             "unit": "V",
             "min": -0.01,
             "max": 0.01,
-            "desc": "Ultra-low Rds(on) ensures negligible conduction drop"
+            "desc": "Low Rds(on) ensures negligible conduction drop (~1.3 mV)"
         },
         {
-            "name": "LR7843 Average Conduction Power",
+            "name": "D4184/LR7843 Conduction Power",
             "key": "p_mosfet_avg",
             "val": meas.get("p_mosfet_avg"),
             "unit": "W",

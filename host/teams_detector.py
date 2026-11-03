@@ -65,6 +65,9 @@ class TeamsAvailability(str, Enum):
 STATUS_MAP = {
     "available": TeamsAvailability.AVAILABLE,
     "busy": TeamsAvailability.BUSY,
+    "inacall": TeamsAvailability.BUSY,
+    "inameeting": TeamsAvailability.BUSY,
+    "onacall": TeamsAvailability.BUSY,
     "donotdisturb": TeamsAvailability.DO_NOT_DISTURB,
     "dnd": TeamsAvailability.DO_NOT_DISTURB,
     "focusing": TeamsAvailability.DO_NOT_DISTURB,
@@ -74,6 +77,8 @@ STATUS_MAP = {
     "away": TeamsAvailability.AWAY,
     "inactive": TeamsAvailability.AWAY,
     "idle": TeamsAvailability.AWAY,
+    "outofoffice": TeamsAvailability.AWAY,
+    "oof": TeamsAvailability.AWAY,
     "offline": TeamsAvailability.OFFLINE,
     "notrunning": TeamsAvailability.OFFLINE,
     "unknown": TeamsAvailability.UNKNOWN,
@@ -84,14 +89,16 @@ STATUS_MAP = {
 def normalize_status(raw: str) -> TeamsAvailability:
     """
     Normalizes a raw presence string from logs or external inputs into a canonical TeamsAvailability enum.
+    Collapses spaces, underscores, and hyphens so multi-word strings like 'Do not disturb' or
+    'Be right back' (emitted by TaskbarModule ShowBadge/SetBadge logs) map cleanly.
 
     Args:
-        raw (str): Raw string such as 'Busy', 'dnd', 'Focusing', 'Away'.
+        raw (str): Raw string such as 'Busy', 'Do not disturb', 'dnd', 'Focusing', 'Away'.
 
     Returns:
         TeamsAvailability: The matching canonical enum value (or TeamsAvailability.UNKNOWN if unrecognized).
     """
-    cleaned = raw.strip().lower()
+    cleaned = re.sub(r"[\s_\-]+", "", raw.strip().lower())
     return STATUS_MAP.get(cleaned, TeamsAvailability.UNKNOWN)
 
 
@@ -350,6 +357,19 @@ class TeamsLogTailer:
         re.IGNORECASE,
     )
 
+    # Regular expression for single-cloud state change events
+    CLOUD_STATE_PATTERN = re.compile(
+        r"UserDataCloudState total number of users:\s*\d+\s*\{\s*availability:\s*([A-Za-z]+)",
+        re.IGNORECASE,
+    )
+
+    # Regular expression for TaskbarModule / TaskbarBadgeService lines (logged FIRST before UserPresenceAction)
+    # Example: "ShowBadge New Badge:NumericBadge{0}, overlay: 0 items, status Do not disturb"
+    BADGE_STATUS_PATTERN = re.compile(
+        r"(?:ShowBadge|SetBadge|Setting badge)\b[^\n]*?,\s*overlay:\s*\d+\s*items,\s*status\s+([A-Za-z ]+?)\s*$",
+        re.IGNORECASE,
+    )
+
     # Regular expression for broadcasted global user presence arrays
     GLOBAL_STATE_PATTERN = re.compile(
         r"UserDataGlobalState total number of users:\s*\d+((?:\s*\{[^}]+\})+)",
@@ -420,21 +440,16 @@ class TeamsLogTailer:
 
     def _initialize_tailer(self):
         """
-        Reads existing contents of the latest log file on startup to seed state,
-        then bookmarks the file position to the end of the file.
+        Reads existing complete lines of the latest log file on startup to seed state,
+        then bookmarks the file position at the last complete newline boundary.
         """
         latest = self._get_latest_log_file()
         if not latest:
             return
 
         self.current_file = latest
-        try:
-            with open(latest, "r", encoding="utf-8", errors="ignore") as fp:
-                for line in fp:
-                    self._parse_line(line)
-                self.file_pos = fp.tell()
-        except Exception:
-            self.file_pos = 0
+        self.file_pos = 0
+        self._read_incremental(latest)
 
     def _parse_line(self, line: str):
         """
@@ -451,7 +466,23 @@ class TeamsLogTailer:
                 self.last_availability = status
                 return
 
-        # 2. Check for UserDataGlobalState multi-user block
+        # 2. Check for UserDataCloudState single-user update
+        cloud_match = self.CLOUD_STATE_PATTERN.search(line)
+        if cloud_match:
+            status = normalize_status(cloud_match.group(1))
+            if status != TeamsAvailability.UNKNOWN:
+                self.last_availability = status
+                return
+
+        # 3. Check for TaskbarModule / TaskbarBadgeService status update (logged earliest on UI change)
+        badge_match = self.BADGE_STATUS_PATTERN.search(line)
+        if badge_match:
+            status = normalize_status(badge_match.group(1))
+            if status != TeamsAvailability.UNKNOWN:
+                self.last_availability = status
+                return
+
+        # 4. Check for UserDataGlobalState multi-user block
         global_match = self.GLOBAL_STATE_PATTERN.search(line)
         if global_match:
             block = global_match.group(1)
@@ -466,7 +497,7 @@ class TeamsLogTailer:
                 self.last_availability = found_availabilities[-1]
                 return
 
-        # 3. Check fallback patterns (e.g. classic Teams logs)
+        # 5. Check fallback patterns (e.g. classic Teams logs)
         for pat in self.FALLBACK_PATTERNS:
             match = pat.search(line)
             if match:
@@ -475,7 +506,7 @@ class TeamsLogTailer:
                     self.last_availability = st
                     return
 
-        # 4. Check for meeting size
+        # 6. Check for meeting size
         m_match = self.MEETING_SIZE_PATTERN.search(line)
         if m_match:
             try:
@@ -497,7 +528,7 @@ class TeamsLogTailer:
         if latest and latest != self.current_file:
             # Finish reading any remaining bytes from the previous file
             if self.current_file and os.path.isfile(self.current_file):
-                self._read_incremental(self.current_file)
+                self._read_incremental(self.current_file, flush_partial=True)
             # Switch to the new file and reset offset
             self.current_file = latest
             self.file_pos = 0
@@ -508,24 +539,49 @@ class TeamsLogTailer:
 
         return self.last_availability, self.meeting_count
 
-    def _read_incremental(self, file_path: str):
+    def _read_incremental(self, file_path: str, flush_partial: bool = False):
         """
-        Seeks to the saved file position, processes newly appended lines, and updates the position.
+        Seeks to the saved byte position, processes newly appended complete lines,
+        and advances `file_pos` only up to the last newline (`\\n`).
+
+        Why only advance to the last `\\n`?
+          `ms-teams.exe` writes `MSTeams_*.log` using an 8 KB C++ stdio buffer that flushes
+          mid-line on 8 KB boundaries. Leaving any trailing partial line (without `\\n`)
+          unconsumed ensures the line is parsed intact once the next buffer flush completes it.
 
         Args:
             file_path (str): Path to the log file to read.
+            flush_partial (bool): If True (e.g. when rotating away from an old file), also parse any trailing partial line.
         """
         try:
             file_size = os.path.getsize(file_path)
             # If the file shrank (truncated), reset pointer to 0
             if file_size < self.file_pos:
                 self.file_pos = 0
+            if file_size == self.file_pos:
+                return
 
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as fp:
+            with open(file_path, "rb") as fp:
                 fp.seek(self.file_pos)
-                for line in fp:
-                    self._parse_line(line)
-                self.file_pos = fp.tell()
+                chunk = fp.read()
+
+            if not chunk:
+                return
+
+            if not flush_partial:
+                last_nl = chunk.rfind(b"\n")
+                if last_nl == -1:
+                    # No complete line has been flushed yet; wait for the rest of the line
+                    return
+                complete_bytes = chunk[: last_nl + 1]
+                self.file_pos += len(complete_bytes)
+            else:
+                complete_bytes = chunk
+                self.file_pos += len(chunk)
+
+            text = complete_bytes.decode("utf-8", errors="ignore")
+            for line in text.splitlines():
+                self._parse_line(line)
         except Exception:
             pass
 

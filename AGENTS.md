@@ -1,4 +1,4 @@
-# USBCommunicator Workspace Guidelines
+# TeamsStatus Workspace Guidelines
 
 ## Project Overview
 This repository implements a 100% local, zero-network Microsoft Teams presence monitor and USB CDC serial communication bridge (`115200` baud) driving a **Waveshare RP2040-Zero** (or Raspberry Pi Pico) running **MicroPython**, plus an accompanying LTspice-verified USB-C & LR7843 MOSFET hardware circuit design.
