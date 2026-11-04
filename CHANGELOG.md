@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.6.0] - 2026-11-03
+
+### Added
+- **Windows Notification Area (System Tray) Icon & "Stop" Menu ([`host/system_tray.py`](file:///D:/Git/USBCommunicator/host/system_tray.py))**:
+  - Added [`SystemTrayIcon`](file:///D:/Git/USBCommunicator/host/system_tray.py#L283-L469) using pure Win32 `ctypes` (`Shell_NotifyIconW`, `CreateDIBSection`, `CreateIconIndirect`) with zero external dependencies.
+  - Dynamically renders a 32×32 circular badge icon in the Windows notification area colored by live Teams presence (`Green` for `Available`, `Red` for `InACall`/`InAMeeting`/`DoNotDisturb`/`Busy`, `Amber` for `Away`/`BeRightBack`, and `Gray` for `Offline`/`NotRunning`).
+  - Displays a live hover tooltip showing the active Teams status, `[ON AIR]` / `[PULSE]` state, and connected RP2040 COM port.
+  - Added a click / right-click context menu displaying live status, RP2040 connection status, and a **`Stop TeamsMonitor`** action that signals [`host/teams_monitor.py`](file:///D:/Git/USBCommunicator/host/teams_monitor.py) to send an `"Offline"` frame to the RP2040 (turning off the LED strip and NeoPixel), remove the tray icon, and terminate cleanly.
+  - Added `--no-tray` CLI flag to [`host/teams_monitor.py`](file:///D:/Git/USBCommunicator/host/teams_monitor.py#L404-L408) if headless execution without a tray icon is ever desired.
+  - Rebuilt standalone executable [`dist/TeamsMonitor.exe`](file:///D:/Git/USBCommunicator/dist/TeamsMonitor.exe) with the system tray icon and 8 KB log buffer lag fix bundled.
+
+---
+
 ## [1.5.0] - 2026-11-02
 
 ### Added

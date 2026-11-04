@@ -23,6 +23,7 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 from typing import Optional
 import winreg
@@ -35,11 +36,13 @@ try:
 except ImportError:
     SERIAL_AVAILABLE = False
 
-# Import TeamsDetector with fallback for direct vs module execution
+# Import TeamsDetector and SystemTrayIcon with fallback for direct vs module execution
 try:
     from host.teams_detector import TeamsDetector, TeamsStatusEvent
+    from host.system_tray import SystemTrayIcon
 except ImportError:
     from teams_detector import TeamsDetector, TeamsStatusEvent
+    from system_tray import SystemTrayIcon
 
 # Windows Registry autorun key
 STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -398,6 +401,11 @@ def main():
         default=None,
         help="File path to save monitor diagnostic logs (ideal for background execution)",
     )
+    parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        help="Disable the Windows Notification Area (System Tray) icon",
+    )
     # Startup management CLI arguments
     parser.add_argument(
         "--install-startup",
@@ -472,6 +480,7 @@ def main():
     print(f"Poll Interval : {args.interval}s")
     print(f"Heartbeat     : {args.heartbeat}s")
     print(f"Serial Target : {'Disabled (Standalone)' if args.standalone else (f'Auto-Discovery (Hardware VID 0x2E8A)' if args.port == 'auto' else f'{args.port} @ {args.baudrate}')}")
+    print(f"System Tray   : {'Disabled (--no-tray)' if args.no_tray else 'Enabled (Windows Notification Area)'}")
     if args.log_file:
         print(f"Logging To    : {args.log_file}")
     print("-" * 65)
@@ -483,6 +492,16 @@ def main():
     ser: Optional["serial.Serial"] = None
     active_port: Optional[str] = None
     last_reconnect_attempt = 0.0
+    stop_event = threading.Event()
+
+    def _request_stop():
+        print("\nStop requested from Windows System Tray icon...")
+        stop_event.set()
+
+    tray: Optional[SystemTrayIcon] = None
+    if not args.no_tray and sys.platform == "win32":
+        tray = SystemTrayIcon(on_stop=_request_stop)
+        tray.start()
 
     # Initial port connection attempt
     if not args.standalone:
@@ -494,12 +513,16 @@ def main():
         else:
             print("Notice: No RP2040 board detected at startup. Standing by in auto-reconnect mode...")
 
+    if tray:
+        initial_snap = detector.get_status()
+        tray.update_state(status=initial_snap.status, port=active_port if (ser and ser.is_open) else None)
+
     last_heartbeat_time = 0.0
 
-    print("\nStarting monitor loop. Press Ctrl+C to exit.\n")
+    print("\nStarting monitor loop. Press Ctrl+C or use the System Tray 'Stop' menu to exit.\n")
 
     try:
-        while True:
+        while not stop_event.is_set():
             now = time.time()
 
             # -------------------------------------------------------------
@@ -518,6 +541,8 @@ def main():
                             # Immediately push current status upon connection
                             current_snap = detector.get_status()
                             send_serial_event(ser, current_snap)
+                            if tray:
+                                tray.update_state(status=current_snap.status, port=active_port)
                             last_heartbeat_time = now
 
             # Poll detector for any newly detected state changes
@@ -542,6 +567,8 @@ def main():
                 if ser and ser.is_open:
                     if not send_serial_event(ser, event):
                         ser = None
+                if tray:
+                    tray.update_state(status=event.status, port=active_port if (ser and ser.is_open) else None)
                 last_heartbeat_time = now
             elif args.heartbeat > 0 and (now - last_heartbeat_time) >= args.heartbeat:
                 # Send periodic heartbeat frame to keep microcontroller state refreshed
@@ -549,14 +576,18 @@ def main():
                 if ser and ser.is_open:
                     if not send_serial_event(ser, current_status):
                         ser = None
+                if tray:
+                    tray.update_state(status=current_status.status, port=active_port if (ser and ser.is_open) else None)
                 last_heartbeat_time = now
 
-            # Sleep for the configured poll interval
-            time.sleep(args.interval)
+            # Wait for the configured poll interval (wakes immediately if stop_event is set)
+            stop_event.wait(timeout=args.interval)
 
     except KeyboardInterrupt:
         print("\nStopping Teams Monitor...")
     finally:
+        if tray is not None:
+            tray.stop()
         # Graceful cleanup: inform the microcontroller that the monitor is shutting down
         if ser is not None and ser.is_open:
             exit_event = detector.get_status()
