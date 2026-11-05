@@ -42,7 +42,8 @@ import glob
 import json
 import os
 import re
-from typing import List, Optional, Tuple
+import threading
+from typing import Dict, List, Optional, Tuple
 import winreg
 
 
@@ -86,6 +87,10 @@ STATUS_MAP = {
 }
 
 
+# Explicit call/meeting presence tokens that indicate an active call in logs
+CALL_STATUS_TOKENS = {"inacall", "inameeting", "onacall"}
+
+
 def normalize_status(raw: str) -> TeamsAvailability:
     """
     Normalizes a raw presence string from logs or external inputs into a canonical TeamsAvailability enum.
@@ -100,6 +105,15 @@ def normalize_status(raw: str) -> TeamsAvailability:
     """
     cleaned = re.sub(r"[\s_\-]+", "", raw.strip().lower())
     return STATUS_MAP.get(cleaned, TeamsAvailability.UNKNOWN)
+
+
+def is_call_status_token(raw: str) -> bool:
+    """
+    Returns True if the raw presence string explicitly denotes an active call or meeting
+    (e.g., 'InACall', 'In a call', 'InAMeeting', 'OnACall').
+    """
+    cleaned = re.sub(r"[\s_\-]+", "", raw.strip().lower())
+    return cleaned in CALL_STATUS_TOKENS
 
 
 @dataclass
@@ -127,6 +141,9 @@ class TeamsStatusEvent:
     is_running: bool
     is_locked: bool
     timestamp: str
+    status_source: str = "Teams Log"
+    log_source: str = "None"
+    meeting_count: int = 0
 
     def to_dict(self) -> dict:
         """
@@ -142,6 +159,9 @@ class TeamsStatusEvent:
             "camera_active": self.camera_active,
             "is_running": self.is_running,
             "is_locked": self.is_locked,
+            "status_source": self.status_source,
+            "log_source": self.log_source,
+            "meeting_count": self.meeting_count,
             "timestamp": self.timestamp,
         }
 
@@ -306,8 +326,9 @@ class WindowsHardwareTracker:
                     try:
                         subkey_name = winreg.EnumKey(root_key, index)
                         index += 1
-                        # Inspect subkeys associated with Teams executables
-                        if "teams" in subkey_name.lower():
+                        # Inspect subkeys associated with known Teams executables (paths use '#' separators)
+                        leaf_exe = subkey_name.replace("\\", "#").split("#")[-1].strip().lower()
+                        if leaf_exe in WindowsProcessTracker.TEAMS_EXECUTABLES:
                             with winreg.OpenKey(root_key, subkey_name) as subkey:
                                 try:
                                     stop_t = winreg.QueryValueEx(subkey, "LastUsedTimeStop")[0]
@@ -411,6 +432,8 @@ class TeamsLogTailer:
         self.current_file: Optional[str] = None
         self.file_pos: int = 0
         self.last_availability: TeamsAvailability = TeamsAvailability.UNKNOWN
+        self.last_log_source: str = "None"
+        self.in_call_from_log: bool = False
         self.meeting_count: int = 0
 
         # Perform initial scan across existing log entries to establish baseline state
@@ -461,49 +484,64 @@ class TeamsLogTailer:
         # 1. Check for specific Action: UserPresenceAction (high confidence)
         action_match = self.ACTION_AVAILABILITY_PATTERN.search(line)
         if action_match:
-            status = normalize_status(action_match.group(1))
+            raw_token = action_match.group(1)
+            status = normalize_status(raw_token)
             if status != TeamsAvailability.UNKNOWN:
                 self.last_availability = status
+                self.last_log_source = "UserPresenceAction"
+                self.in_call_from_log = is_call_status_token(raw_token)
                 return
 
         # 2. Check for UserDataCloudState single-user update
         cloud_match = self.CLOUD_STATE_PATTERN.search(line)
         if cloud_match:
-            status = normalize_status(cloud_match.group(1))
+            raw_token = cloud_match.group(1)
+            status = normalize_status(raw_token)
             if status != TeamsAvailability.UNKNOWN:
                 self.last_availability = status
+                self.last_log_source = "CloudState"
+                self.in_call_from_log = is_call_status_token(raw_token)
                 return
 
         # 3. Check for TaskbarModule / TaskbarBadgeService status update (logged earliest on UI change)
         badge_match = self.BADGE_STATUS_PATTERN.search(line)
         if badge_match:
-            status = normalize_status(badge_match.group(1))
+            raw_token = badge_match.group(1)
+            status = normalize_status(raw_token)
             if status != TeamsAvailability.UNKNOWN:
                 self.last_availability = status
+                self.last_log_source = "TaskbarBadge"
+                self.in_call_from_log = is_call_status_token(raw_token)
                 return
 
         # 4. Check for UserDataGlobalState multi-user block
         global_match = self.GLOBAL_STATE_PATTERN.search(line)
         if global_match:
             block = global_match.group(1)
-            found_availabilities: List[TeamsAvailability] = []
+            found_availabilities: List[Tuple[TeamsAvailability, str]] = []
             for item in self.ITEM_AVAILABILITY_PATTERN.finditer(block):
-                st = normalize_status(item.group(1))
+                raw_token = item.group(1)
+                st = normalize_status(raw_token)
                 if st != TeamsAvailability.UNKNOWN:
-                    found_availabilities.append(st)
+                    found_availabilities.append((st, raw_token))
 
             # Prioritize active presence over Unknown placeholder
             if found_availabilities:
-                self.last_availability = found_availabilities[-1]
+                self.last_availability, last_raw = found_availabilities[-1]
+                self.last_log_source = "GlobalState"
+                self.in_call_from_log = is_call_status_token(last_raw)
                 return
 
         # 5. Check fallback patterns (e.g. classic Teams logs)
         for pat in self.FALLBACK_PATTERNS:
             match = pat.search(line)
             if match:
-                st = normalize_status(match.group(1))
+                raw_token = match.group(1)
+                st = normalize_status(raw_token)
                 if st != TeamsAvailability.UNKNOWN:
                     self.last_availability = st
+                    self.last_log_source = "LegacyLog"
+                    self.in_call_from_log = is_call_status_token(raw_token)
                     return
 
         # 6. Check for meeting size
@@ -586,6 +624,225 @@ class TeamsLogTailer:
             pass
 
 
+class StatusPriorityConfig:
+    """
+    Thread-safe configuration for Teams status driver precedence and per-signal enable/disable flags.
+
+    Supports live reordering, signal toggling, 1-click presets, and persistence in the Windows
+    Registry (`HKCU\\Software\\TeamsStatus`) so taskbar settings survive restarts.
+    """
+
+    REG_KEY_PATH = r"Software\TeamsStatus"
+    REG_VALUE_NAME = "PriorityConfig"
+
+    DRIVER_LABELS: Dict[str, str] = {
+        "process": "Process Check (-> NotRunning)",
+        "lock": "Session Lock (-> Away)",
+        "teams_log": "Teams Log Presence",
+        "microphone": "Microphone (-> InACall)",
+        "camera": "Camera (-> InACall)",
+        "meeting_size": "Meeting Size > 0 (-> InACall)",
+    }
+
+    DEFAULT_ORDER: List[str] = [
+        "process",
+        "lock",
+        "teams_log",
+        "microphone",
+        "camera",
+        "meeting_size",
+    ]
+
+    DEFAULT_ENABLED: Dict[str, bool] = {
+        "process": True,
+        "lock": True,
+        "teams_log": True,
+        "microphone": True,
+        "camera": True,
+        "meeting_size": False,
+    }
+
+    PRESETS: Dict[str, Tuple[str, List[str], Dict[str, bool]]] = {
+        "corporate_safe": (
+            "Corporate Safe (Default)",
+            ["process", "lock", "teams_log", "microphone", "camera", "meeting_size"],
+            {
+                "process": True,
+                "lock": True,
+                "teams_log": True,
+                "microphone": True,
+                "camera": True,
+                "meeting_size": False,
+            },
+        ),
+        "hardware_first": (
+            "Hardware First (Mic/Cam Override Log)",
+            ["process", "lock", "microphone", "camera", "teams_log", "meeting_size"],
+            {
+                "process": True,
+                "lock": True,
+                "teams_log": True,
+                "microphone": True,
+                "camera": True,
+                "meeting_size": False,
+            },
+        ),
+        "log_only": (
+            "Teams Log Only (Ignore Hardware/Meetings)",
+            ["process", "lock", "teams_log", "microphone", "camera", "meeting_size"],
+            {
+                "process": True,
+                "lock": True,
+                "teams_log": True,
+                "microphone": False,
+                "camera": False,
+                "meeting_size": False,
+            },
+        ),
+        "strict": (
+            "Strict (All Signals Active)",
+            ["process", "lock", "teams_log", "microphone", "camera", "meeting_size"],
+            {
+                "process": True,
+                "lock": True,
+                "teams_log": True,
+                "microphone": True,
+                "camera": True,
+                "meeting_size": True,
+            },
+        ),
+    }
+
+    def __init__(
+        self,
+        order: Optional[List[str]] = None,
+        enabled: Optional[Dict[str, bool]] = None,
+    ):
+        self._lock = threading.Lock()
+        self.order: List[str] = list(self.DEFAULT_ORDER)
+        self.enabled: Dict[str, bool] = dict(self.DEFAULT_ENABLED)
+        if order is not None or enabled is not None:
+            self._apply_unlocked(order, enabled)
+
+    def _apply_unlocked(
+        self,
+        order: Optional[List[str]] = None,
+        enabled: Optional[Dict[str, bool]] = None,
+    ) -> None:
+        if order is not None:
+            valid = [d for d in order if d in self.DRIVER_LABELS]
+            for d in self.DEFAULT_ORDER:
+                if d not in valid:
+                    valid.append(d)
+            self.order = valid
+        if enabled is not None:
+            for d in self.DEFAULT_ORDER:
+                if d in enabled:
+                    self.enabled[d] = bool(enabled[d])
+
+    def snapshot(self) -> Tuple[List[str], Dict[str, bool]]:
+        """Returns a thread-safe copy of (order, enabled)."""
+        with self._lock:
+            return list(self.order), dict(self.enabled)
+
+    def move_up(self, driver_id: str) -> bool:
+        """Moves `driver_id` one position higher in priority (toward index 0)."""
+        with self._lock:
+            if driver_id not in self.order:
+                return False
+            idx = self.order.index(driver_id)
+            if idx <= 0:
+                return False
+            self.order[idx - 1], self.order[idx] = self.order[idx], self.order[idx - 1]
+            return True
+
+    def move_down(self, driver_id: str) -> bool:
+        """Moves `driver_id` one position lower in priority (toward the end)."""
+        with self._lock:
+            if driver_id not in self.order:
+                return False
+            idx = self.order.index(driver_id)
+            if idx >= len(self.order) - 1:
+                return False
+            self.order[idx + 1], self.order[idx] = self.order[idx], self.order[idx + 1]
+            return True
+
+    def toggle(self, driver_id: str) -> bool:
+        """Flips the enabled state of `driver_id` and returns its new state."""
+        with self._lock:
+            if driver_id not in self.enabled:
+                return False
+            self.enabled[driver_id] = not self.enabled[driver_id]
+            return self.enabled[driver_id]
+
+    def set_enabled(self, driver_id: str, value: bool) -> None:
+        """Explicitly sets the enabled state of `driver_id`."""
+        with self._lock:
+            if driver_id in self.enabled:
+                self.enabled[driver_id] = bool(value)
+
+    def apply_preset(self, preset_key: str) -> bool:
+        """Applies one of the named presets in `PRESETS`."""
+        with self._lock:
+            if preset_key not in self.PRESETS:
+                return False
+            _, preset_order, preset_enabled = self.PRESETS[preset_key]
+            self.order = list(preset_order)
+            self.enabled = dict(preset_enabled)
+            return True
+
+    def reset_defaults(self) -> None:
+        """Resets order and enabled flags to the Corporate Safe defaults."""
+        with self._lock:
+            self.order = list(self.DEFAULT_ORDER)
+            self.enabled = dict(self.DEFAULT_ENABLED)
+
+    def get_active_preset(self) -> Optional[str]:
+        """Returns the preset key matching the current configuration, or None if custom."""
+        with self._lock:
+            for key, (_, p_order, p_enabled) in self.PRESETS.items():
+                if self.order == p_order and self.enabled == p_enabled:
+                    return key
+            return None
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            return {
+                "order": list(self.order),
+                "enabled": dict(self.enabled),
+            }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StatusPriorityConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            order=data.get("order"),
+            enabled=data.get("enabled"),
+        )
+
+    def save_to_registry(self) -> bool:
+        """Persists current priority configuration as JSON in HKCU\\Software\\TeamsStatus."""
+        try:
+            payload = json.dumps(self.to_dict())
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.REG_KEY_PATH) as key:
+                winreg.SetValueEx(key, self.REG_VALUE_NAME, 0, winreg.REG_SZ, payload)
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def load_from_registry(cls) -> "StatusPriorityConfig":
+        """Loads saved priority configuration from HKCU\\Software\\TeamsStatus, or defaults if absent."""
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cls.REG_KEY_PATH, 0, winreg.KEY_READ) as key:
+                raw, _ = winreg.QueryValueEx(key, cls.REG_VALUE_NAME)
+                data = json.loads(raw)
+                return cls.from_dict(data)
+        except Exception:
+            return cls()
+
+
 class TeamsDetector:
     """
     Aggregates log tailing, hardware states, process status, and workstation state into unified events.
@@ -593,27 +850,37 @@ class TeamsDetector:
     Synthesizes discrete OS and application signals into a coherent status and supports change polling.
     """
 
-    def __init__(self, log_dir: Optional[str] = None):
+    def __init__(
+        self,
+        log_dir: Optional[str] = None,
+        priority_config: Optional[StatusPriorityConfig] = None,
+    ):
         """
-        Initializes the TeamsDetector with a configured log tailer.
+        Initializes the TeamsDetector with a configured log tailer and priority configuration.
 
         Args:
             log_dir (str, optional): Custom path to Teams log directory.
+            priority_config (StatusPriorityConfig, optional): Custom priority order & signal config.
         """
         self.log_tailer = TeamsLogTailer(log_dir)
+        self.priority_config = priority_config if priority_config is not None else StatusPriorityConfig()
         self.last_event: Optional[TeamsStatusEvent] = None
 
     def get_status(self) -> TeamsStatusEvent:
         """
-        Queries all trackers, combines their states according to precedence rules,
+        Queries all trackers, combines their states according to the active `priority_config` rules,
         and constructs a snapshot `TeamsStatusEvent`.
 
-        Status Precedence Rules:
+        Default Status Precedence Rules ('Corporate Safe'):
           1. Process not running  -> 'NotRunning'
           2. Workstation locked   -> 'Away'
-          3. In a call / meeting  -> 'InACall' (or preserves DND if user manually set DND)
-          4. Known Availability   -> Underlying availability (e.g. 'Busy', 'DoNotDisturb', 'Available')
-          5. Default fallback     -> 'Available'
+          3. Teams Log Presence   -> Explicit log presence ('Available', 'Away', 'DoNotDisturb', etc.),
+                                     promoting 'Busy' -> 'InACall' when enabled lower-rank call triggers
+                                     (Microphone, Camera, or Meeting Size) are active.
+          4. Microphone active    -> 'InACall' (if ranked above Teams Log, or if Teams Log is Unknown)
+          5. Camera active        -> 'InACall' (if ranked above Teams Log, or if Teams Log is Unknown)
+          6. Meeting Size > 0     -> 'InACall' (disabled by default; can be enabled in tray)
+          7. Default fallback     -> 'Available'
 
         Returns:
             TeamsStatusEvent: Complete snapshot of current status.
@@ -626,20 +893,114 @@ class TeamsDetector:
 
         # Tail latest log updates
         availability, meeting_count = self.log_tailer.poll()
-        in_meeting = meeting_count > 0
-        in_call = in_meeting or mic_active
+        log_source = getattr(self.log_tailer, "last_log_source", "None")
+        in_call_from_log = getattr(self.log_tailer, "in_call_from_log", False)
 
-        # Synthesize effective status according to priority rules
-        if not is_running:
-            effective = "NotRunning"
-        elif is_locked:
-            effective = "Away"
-        elif in_call:
-            effective = "InACall" if availability in (TeamsAvailability.BUSY, TeamsAvailability.AVAILABLE) else availability.value
-        elif availability != TeamsAvailability.UNKNOWN:
-            effective = availability.value
-        else:
+        order, enabled = self.priority_config.snapshot()
+
+        effective: Optional[str] = None
+        status_source: str = "Default Fallback (No active signal)"
+        in_call: bool = False
+        in_meeting: bool = False
+
+        for idx, driver_id in enumerate(order):
+            if not enabled.get(driver_id, True):
+                continue
+
+            if driver_id == "process":
+                if not is_running:
+                    effective = "NotRunning"
+                    status_source = "Process Monitor (Teams not running)"
+                    break
+
+            elif driver_id == "lock":
+                if is_locked:
+                    effective = "Away"
+                    status_source = "Session Monitor (Workstation locked)"
+                    break
+
+            elif driver_id == "microphone":
+                if mic_active:
+                    effective = "InACall"
+                    in_call = True
+                    drivers = ["Microphone"]
+                    if enabled.get("camera", False) and camera_active:
+                        drivers.append("Camera")
+                    if enabled.get("meeting_size", False) and meeting_count > 0:
+                        drivers.append(f"Meeting Size ({meeting_count})")
+                        in_meeting = True
+                    if enabled.get("teams_log", False) and availability != TeamsAvailability.UNKNOWN:
+                        drivers.append(f"Teams Log ({log_source}: {availability.value})")
+                    status_source = " + ".join(drivers)
+                    break
+
+            elif driver_id == "camera":
+                if camera_active:
+                    effective = "InACall"
+                    in_call = True
+                    drivers = ["Camera"]
+                    if enabled.get("microphone", False) and mic_active:
+                        drivers.append("Microphone")
+                    if enabled.get("meeting_size", False) and meeting_count > 0:
+                        drivers.append(f"Meeting Size ({meeting_count})")
+                        in_meeting = True
+                    if enabled.get("teams_log", False) and availability != TeamsAvailability.UNKNOWN:
+                        drivers.append(f"Teams Log ({log_source}: {availability.value})")
+                    status_source = " + ".join(drivers)
+                    break
+
+            elif driver_id == "meeting_size":
+                if meeting_count > 0:
+                    effective = "InACall"
+                    in_call = True
+                    in_meeting = True
+                    drivers = [f"Meeting Size ({meeting_count})"]
+                    if enabled.get("microphone", False) and mic_active:
+                        drivers.append("Microphone")
+                    if enabled.get("camera", False) and camera_active:
+                        drivers.append("Camera")
+                    if enabled.get("teams_log", False) and availability != TeamsAvailability.UNKNOWN:
+                        drivers.append(f"Teams Log ({log_source}: {availability.value})")
+                    status_source = " + ".join(drivers)
+                    break
+
+            elif driver_id == "teams_log":
+                if availability != TeamsAvailability.UNKNOWN or in_call_from_log:
+                    # Check enabled call triggers ranked below teams_log to refine Busy -> InACall
+                    lower_drivers = set(order[idx + 1 :])
+                    mic_call = ("microphone" in lower_drivers) and enabled.get("microphone", False) and mic_active
+                    cam_call = ("camera" in lower_drivers) and enabled.get("camera", False) and camera_active
+                    mtg_call = ("meeting_size" in lower_drivers) and enabled.get("meeting_size", False) and (meeting_count > 0)
+                    any_call_trigger = in_call_from_log or mic_call or cam_call or mtg_call
+
+                    if availability in (TeamsAvailability.BUSY, TeamsAvailability.DO_NOT_DISTURB, TeamsAvailability.UNKNOWN) and any_call_trigger:
+                        in_call = True
+                        in_meeting = in_call and (meeting_count > 0 or in_call_from_log)
+                        effective = (
+                            "InACall"
+                            if availability in (TeamsAvailability.BUSY, TeamsAvailability.UNKNOWN)
+                            else availability.value
+                        )
+                        call_drivers = []
+                        if availability != TeamsAvailability.UNKNOWN:
+                            call_drivers.append(f"Teams Log ({log_source}: {availability.value})")
+                        elif in_call_from_log:
+                            call_drivers.append(f"Teams Log ({log_source}: InACall)")
+                        if mic_call:
+                            call_drivers.append("Microphone")
+                        if cam_call:
+                            call_drivers.append("Camera")
+                        if mtg_call or (meeting_count > 0 and (mic_call or cam_call)):
+                            call_drivers.append(f"Meeting Size ({meeting_count})")
+                        status_source = " + ".join(call_drivers) if call_drivers else "Call Active"
+                    else:
+                        effective = availability.value
+                        status_source = f"Teams Log ({log_source}: {availability.value})"
+                    break
+
+        if effective is None:
             effective = "Available"
+            status_source = "Default Fallback (No log entry)"
 
         # Generate ISO timestamp with local timezone offset
         now_iso = datetime.now(timezone.utc).astimezone().isoformat()
@@ -654,6 +1015,9 @@ class TeamsDetector:
             is_running=is_running,
             is_locked=is_locked,
             timestamp=now_iso,
+            status_source=status_source,
+            log_source=log_source,
+            meeting_count=meeting_count,
         )
         return event
 
@@ -672,11 +1036,14 @@ class TeamsDetector:
         # Compare critical fields to detect state transitions
         changed = (
             current.status != self.last_event.status
+            or current.availability != self.last_event.availability
             or current.in_call != self.last_event.in_call
             or current.mic_active != self.last_event.mic_active
             or current.camera_active != self.last_event.camera_active
             or current.is_running != self.last_event.is_running
             or current.is_locked != self.last_event.is_locked
+            or current.status_source != self.last_event.status_source
+            or current.meeting_count != self.last_event.meeting_count
         )
 
         if changed:

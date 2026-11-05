@@ -38,10 +38,10 @@ except ImportError:
 
 # Import TeamsDetector and SystemTrayIcon with fallback for direct vs module execution
 try:
-    from host.teams_detector import TeamsDetector, TeamsStatusEvent
+    from host.teams_detector import StatusPriorityConfig, TeamsDetector, TeamsStatusEvent
     from host.system_tray import SystemTrayIcon
 except ImportError:
-    from teams_detector import TeamsDetector, TeamsStatusEvent
+    from teams_detector import StatusPriorityConfig, TeamsDetector, TeamsStatusEvent
     from system_tray import SystemTrayIcon
 
 # Windows Registry autorun key
@@ -485,22 +485,36 @@ def main():
         print(f"Logging To    : {args.log_file}")
     print("-" * 65)
 
-    # Instantiate detector
-    detector = TeamsDetector(log_dir=args.log_dir)
+    # Load persisted status priority configuration and instantiate detector
+    priority_config = StatusPriorityConfig.load_from_registry()
+    detector = TeamsDetector(log_dir=args.log_dir, priority_config=priority_config)
 
     # Initialize serial connection variables
     ser: Optional["serial.Serial"] = None
     active_port: Optional[str] = None
     last_reconnect_attempt = 0.0
     stop_event = threading.Event()
+    config_changed_event = threading.Event()
 
     def _request_stop():
         print("\nStop requested from Windows System Tray icon...")
         stop_event.set()
 
+    def _on_priority_config_change():
+        order, enabled = priority_config.snapshot()
+        active_chain = " > ".join(d for d in order if enabled.get(d, True))
+        print(f"[{time.strftime('%H:%M:%S')}] Taskbar Priority Updated: {active_chain}", flush=True)
+        # Reset last_event so the next poll immediately emits & dispatches the newly synthesized state
+        detector.last_event = None
+        config_changed_event.set()
+
     tray: Optional[SystemTrayIcon] = None
     if not args.no_tray and sys.platform == "win32":
-        tray = SystemTrayIcon(on_stop=_request_stop)
+        tray = SystemTrayIcon(
+            on_stop=_request_stop,
+            priority_config=priority_config,
+            on_config_change=_on_priority_config_change,
+        )
         tray.start()
 
     # Initial port connection attempt
@@ -515,7 +529,11 @@ def main():
 
     if tray:
         initial_snap = detector.get_status()
-        tray.update_state(status=initial_snap.status, port=active_port if (ser and ser.is_open) else None)
+        tray.update_state(
+            status=initial_snap.status,
+            port=active_port if (ser and ser.is_open) else None,
+            event=initial_snap,
+        )
 
     last_heartbeat_time = 0.0
 
@@ -542,7 +560,11 @@ def main():
                             current_snap = detector.get_status()
                             send_serial_event(ser, current_snap)
                             if tray:
-                                tray.update_state(status=current_snap.status, port=active_port)
+                                tray.update_state(
+                                    status=current_snap.status,
+                                    port=active_port,
+                                    event=current_snap,
+                                )
                             last_heartbeat_time = now
 
             # Poll detector for any newly detected state changes
@@ -551,15 +573,15 @@ def main():
             if event is not None:
                 # Format detailed console status line
                 badge = format_status_badge(event.status)
-                call_info = " [In Call]" if event.in_call else ""
-                mic_info = " [Mic Active]" if event.mic_active else ""
-                cam_info = " [Cam Active]" if event.camera_active else ""
-                lock_info = " [PC Locked]" if event.is_locked else ""
+                mic_state = "On" if event.mic_active else "Off"
+                cam_state = "On" if event.camera_active else "Off"
+                lock_info = " | PC Locked" if event.is_locked else ""
                 port_tag = f" [{active_port}]" if (ser and ser.is_open and active_port) else " [No Serial]"
 
                 print(
-                    f"[{time.strftime('%H:%M:%S')}]{port_tag} {badge:20} Status: {event.status:12} "
-                    f"(Raw: {event.availability}){call_info}{mic_info}{cam_info}{lock_info}",
+                    f"[{time.strftime('%H:%M:%S')}]{port_tag} {badge:18} Status: {event.status:12} "
+                    f"| Driven by: {event.status_source} "
+                    f"[Log: {event.availability} ({event.log_source}) | Meetings: {event.meeting_count} | Mic: {mic_state} | Cam: {cam_state}{lock_info}]",
                     flush=True,
                 )
 
@@ -568,7 +590,11 @@ def main():
                     if not send_serial_event(ser, event):
                         ser = None
                 if tray:
-                    tray.update_state(status=event.status, port=active_port if (ser and ser.is_open) else None)
+                    tray.update_state(
+                        status=event.status,
+                        port=active_port if (ser and ser.is_open) else None,
+                        event=event,
+                    )
                 last_heartbeat_time = now
             elif args.heartbeat > 0 and (now - last_heartbeat_time) >= args.heartbeat:
                 # Send periodic heartbeat frame to keep microcontroller state refreshed
@@ -577,11 +603,18 @@ def main():
                     if not send_serial_event(ser, current_status):
                         ser = None
                 if tray:
-                    tray.update_state(status=current_status.status, port=active_port if (ser and ser.is_open) else None)
+                    tray.update_state(
+                        status=current_status.status,
+                        port=active_port if (ser and ser.is_open) else None,
+                        event=current_status,
+                    )
                 last_heartbeat_time = now
 
-            # Wait for the configured poll interval (wakes immediately if stop_event is set)
-            stop_event.wait(timeout=args.interval)
+            # Wait for the configured poll interval (wakes immediately if stop or config change occurs)
+            if config_changed_event.is_set():
+                config_changed_event.clear()
+            else:
+                stop_event.wait(timeout=args.interval)
 
     except KeyboardInterrupt:
         print("\nStopping Teams Monitor...")

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 try:
     from host.teams_detector import (
         STATUS_MAP,
+        StatusPriorityConfig,
         TeamsAvailability,
         TeamsDetector,
         TeamsLogTailer,
@@ -35,6 +36,7 @@ try:
 except ImportError:
     from teams_detector import (
         STATUS_MAP,
+        StatusPriorityConfig,
         TeamsAvailability,
         TeamsDetector,
         TeamsLogTailer,
@@ -212,14 +214,16 @@ class TestTeamsDetector(unittest.TestCase):
     def test_detector_state_logic(self):
         """
         Verifies the precedence rules of TeamsDetector by mocking Windows API trackers:
-          - Running + Unlocked + Mic off -> Available
-          - Running + Unlocked + Mic on  -> InACall
-          - Running + Locked             -> Away
-          - Not running                  -> NotRunning
+          - Running + Unlocked + Available (even with calendar meetings in meetingstore) -> Available
+          - Running + Unlocked + Busy (mic & cam off) -> Busy
+          - Running + Unlocked + Busy + Mic on -> InACall
+          - Running + Locked -> Away
+          - Not running -> NotRunning
         """
         log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
         with open(log_file, "w", encoding="utf-8") as f:
-            f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.live.com, availability: Available}\n")
+            f.write("2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.microsoft.com, availability: Available}\n")
+            f.write("2026-08-19T10:00:01.000 <DBG> cross_cloud::meetingstore: meetings size: 3\n")
 
         detector = TeamsDetector(log_dir=self.test_dir)
 
@@ -229,7 +233,7 @@ class TestTeamsDetector(unittest.TestCase):
              patch(f"{mod_name}.WindowsHardwareTracker.is_mic_active") as mock_mic, \
              patch(f"{mod_name}.WindowsHardwareTracker.is_camera_active") as mock_cam:
 
-            # 1. Normal Available state: Teams running, session unlocked, mic & cam inactive
+            # 1. Normal Available state on corporate Teams (even with meetingstore > 0 or stray mic):
             mock_running.return_value = True
             mock_locked.return_value = False
             mock_mic.return_value = False
@@ -238,26 +242,127 @@ class TestTeamsDetector(unittest.TestCase):
             status = detector.get_status()
             self.assertEqual(status.status, "Available")
             self.assertFalse(status.in_call)
+            self.assertEqual(status.log_source, "UserPresenceAction")
+            self.assertEqual(status.meeting_count, 3)
+            self.assertEqual(status.status_source, "Teams Log (UserPresenceAction: Available)")
 
-            # 2. In Call state: Microphone becomes active during a voice/video call
+            # Even if mic_active reports True while presence is explicitly Available,
+            # Available must not be falsely overridden to InACall
+            mock_mic.return_value = True
+            status = detector.get_status()
+            self.assertEqual(status.status, "Available")
+            self.assertFalse(status.in_call)
+            self.assertEqual(status.status_source, "Teams Log (UserPresenceAction: Available)")
+
+            # 2. Busy state (not in a call: mic & cam inactive)
+            mock_mic.return_value = False
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("2026-08-19T10:02:00.000 <INFO> native_modules::UserDataCrossCloudModule: Received Action: UserPresenceAction: {cloud_context: https://teams.microsoft.com, availability: Busy}\n")
+            status = detector.get_status()
+            self.assertEqual(status.status, "Busy")
+            self.assertFalse(status.in_call)
+            self.assertEqual(status.status_source, "Teams Log (UserPresenceAction: Busy)")
+
+            # 3. In Call state: User is Busy and microphone becomes active during a voice/video call
             mock_mic.return_value = True
             status = detector.get_status()
             self.assertEqual(status.status, "InACall")
             self.assertTrue(status.in_call)
+            self.assertIn("Microphone", status.status_source)
+            self.assertIn("Meeting Size (3)", status.status_source)
 
-            # 3. Workstation Locked: User locks their computer (Win+L)
+            # 4. Workstation Locked: User locks their computer (Win+L)
             mock_mic.return_value = False
             mock_locked.return_value = True
             status = detector.get_status()
             self.assertEqual(status.status, "Away")
             self.assertTrue(status.is_locked)
+            self.assertEqual(status.status_source, "Session Monitor (Workstation locked)")
 
-            # 4. Teams closed: Application terminated
+            # 5. Teams closed: Application terminated
             mock_locked.return_value = False
             mock_running.return_value = False
             status = detector.get_status()
             self.assertEqual(status.status, "NotRunning")
             self.assertFalse(status.is_running)
+            self.assertEqual(status.status_source, "Process Monitor (Teams not running)")
+
+    def test_custom_priority_and_signal_toggles(self):
+        """
+        Verifies user-configurable taskbar priority reordering, presets, and signal toggling:
+          - Moving `microphone` above `teams_log` (or applying 'hardware_first' preset) allows
+            active mic to override 'Available' -> 'InACall'.
+          - Applying 'log_only' preset ignores mic/camera/meeting_size so 'Busy' remains 'Busy'.
+          - Enabling `meeting_size` allows meeting_count > 0 to promote 'Busy' -> 'InACall'.
+        """
+        log_file = os.path.join(self.test_dir, "MSTeams_2026-08-19_01-00-00.00.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(
+                "2026-08-19T10:00:00.000 <INFO> native_modules::UserDataCrossCloudModule: "
+                "Received Action: UserPresenceAction: {cloud_context: https://teams.microsoft.com, availability: Available}\n"
+            )
+            f.write("2026-08-19T10:00:01.000 <DBG> cross_cloud::meetingstore: meetings size: 2\n")
+
+        cfg = StatusPriorityConfig()
+        detector = TeamsDetector(log_dir=self.test_dir, priority_config=cfg)
+
+        mod_name = "host.teams_detector" if "host.teams_detector" in sys.modules else "teams_detector"
+        with patch(f"{mod_name}.WindowsProcessTracker.is_running") as mock_running, \
+             patch(f"{mod_name}.WindowsSessionTracker.is_locked") as mock_locked, \
+             patch(f"{mod_name}.WindowsHardwareTracker.is_mic_active") as mock_mic, \
+             patch(f"{mod_name}.WindowsHardwareTracker.is_camera_active") as mock_cam:
+
+            mock_running.return_value = True
+            mock_locked.return_value = False
+            mock_mic.return_value = True
+            mock_cam.return_value = False
+
+            # 1. Default ('corporate_safe'): teams_log is above microphone -> Available wins
+            self.assertEqual(cfg.get_active_preset(), "corporate_safe")
+            status = detector.get_status()
+            self.assertEqual(status.status, "Available")
+            self.assertFalse(status.in_call)
+
+            # 2. Move 'microphone' above 'teams_log': active mic now overrides Available -> InACall
+            cfg.move_up("microphone")
+            self.assertIsNone(cfg.get_active_preset())
+            status = detector.get_status()
+            self.assertEqual(status.status, "InACall")
+            self.assertTrue(status.in_call)
+            self.assertIn("Microphone", status.status_source)
+
+            # 3. Disable 'microphone' toggle: falls back to teams_log ('Available')
+            cfg.toggle("microphone")
+            status = detector.get_status()
+            self.assertEqual(status.status, "Available")
+            self.assertFalse(status.in_call)
+
+            # 4. Log changes to Busy; apply 'log_only' preset -> stays Busy even with mic_active=True
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(
+                    "2026-08-19T10:05:00.000 <INFO> native_modules::UserDataCrossCloudModule: "
+                    "Received Action: UserPresenceAction: {cloud_context: https://teams.microsoft.com, availability: Busy}\n"
+                )
+            cfg.apply_preset("log_only")
+            self.assertEqual(cfg.get_active_preset(), "log_only")
+            status = detector.get_status()
+            self.assertEqual(status.status, "Busy")
+            self.assertFalse(status.in_call)
+
+            # 5. Apply 'strict' preset (enables meeting_size) with mic off -> meeting_size (2) promotes Busy -> InACall
+            mock_mic.return_value = False
+            cfg.apply_preset("strict")
+            self.assertEqual(cfg.get_active_preset(), "strict")
+            status = detector.get_status()
+            self.assertEqual(status.status, "InACall")
+            self.assertTrue(status.in_call)
+            self.assertIn("Meeting Size (2)", status.status_source)
+
+            # 6. Serialization round-trip & reset_defaults
+            restored = StatusPriorityConfig.from_dict(cfg.to_dict())
+            self.assertEqual(restored.get_active_preset(), "strict")
+            cfg.reset_defaults()
+            self.assertEqual(cfg.get_active_preset(), "corporate_safe")
 
 
 if __name__ == "__main__":

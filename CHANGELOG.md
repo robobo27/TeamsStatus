@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.7.0] - 2026-11-04
+
+### Added
+- **Taskbar Status Driver Priority & Signal Controls ([`host/system_tray.py`](host/system_tray.py), [`host/teams_detector.py`](host/teams_detector.py))**:
+  - Added [`StatusPriorityConfig`](host/teams_detector.py#L628-L824) allowing users to reorder status drivers (`Move Up` / `Move Down`), toggle individual signals on or off, or apply 1-click presets (`Corporate Safe`, `Hardware First`, `Teams Log Only`, `Strict`) directly from the **`Priority & Signals (Top Wins)`** cascading submenu in the Windows Notification Area (System Tray) icon.
+  - Persists user priority order and signal enable/disable settings in the Windows Registry (`HKCU\Software\TeamsStatus\PriorityConfig`) and triggers immediate state re-evaluation and RP2040 synchronization in [`host/teams_monitor.py`](host/teams_monitor.py#L502-L508).
+- **Status Driver & Sensor Diagnostics in Tray Tooltip, Context Menu, and Console**:
+  - Extended [`TeamsStatusEvent`](host/teams_detector.py#L118-L171) with `status_source`, `log_source`, and `meeting_count`.
+  - Updated the System Tray hover tooltip, popup context menu, and console log output to display what is actively driving the status (`Driven By: ...`) alongside individual sensor states (`Teams Log`, `Meeting Size`, `Microphone`, `Camera`, and `Session`).
+  - Added [`test_custom_priority_and_signal_toggles`](host/test_teams_detector.py#L291-L366) unit test in [`host/test_teams_detector.py`](host/test_teams_detector.py).
+
+### Fixed
+- **False `InACall` Status While `Available` on Corporate Microsoft Teams ([`host/teams_detector.py`](host/teams_detector.py))**:
+  - Stopped treating `cross_cloud::meetingstore: meetings size: > 0` as a default active call trigger (`meeting_size` now defaults to disabled in `StatusPriorityConfig`), as corporate Teams caches scheduled Outlook/Exchange calendar entries in `meetingstore` for the Windows Taskbar JumpList even when not in a call.
+  - Prevented explicit `Available` presence in Teams logs from being overridden to `InACall` under the default `Corporate Safe` priority order (`Teams Log Presence` ranked above `Microphone` / `Camera`), while still promoting `Busy` $\rightarrow$ `InACall` when active hardware capture (`mic_active` / `camera_active`) or explicit call log tokens (`InACall` / `InAMeeting` / `OnACall`) are present.
+  - Tightened `NonPackaged` registry matching in [`WindowsHardwareTracker._is_capability_in_use()`](host/teams_detector.py#L322-L325) to match exact Teams executable filenames (`ms-teams.exe`, `msteams.exe`, `teams.exe`).
+
+---
+
 ## [1.6.0] - 2026-11-03
 
 ### Added

@@ -16,7 +16,7 @@ import ctypes
 from ctypes import wintypes
 import sys
 import threading
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
 # Win32 Constants
@@ -42,6 +42,8 @@ NIF_TIP = 0x00000004
 MF_STRING = 0x00000000
 MF_GRAYED = 0x00000001
 MF_DISABLED = 0x00000002
+MF_CHECKED = 0x00000008
+MF_POPUP = 0x00000010
 MF_SEPARATOR = 0x00000800
 
 TPM_LEFTALIGN = 0x0000
@@ -334,11 +336,26 @@ class SystemTrayIcon:
     Manages a Windows Notification Area (System Tray) icon in a background daemon thread.
     """
 
-    def __init__(self, on_stop: Callable[[], None]):
+    def __init__(
+        self,
+        on_stop: Callable[[], None],
+        priority_config: Optional[Any] = None,
+        on_config_change: Optional[Callable[[], None]] = None,
+    ):
         self.on_stop = on_stop
+        self.priority_config = priority_config
+        self.on_config_change = on_config_change
         self._lock = threading.Lock()
         self._status = "Unknown"
         self._port: Optional[str] = None
+        self._status_source = "Initializing..."
+        self._availability = "Unknown"
+        self._log_source = "None"
+        self._meeting_count = 0
+        self._mic_active = False
+        self._camera_active = False
+        self._is_locked = False
+        self._is_running = False
         self._hwnd: Optional[wintypes.HWND] = None
         self._nid: Optional[NOTIFYICONDATAW] = None
         self._icon_cache: Dict[Tuple[int, int, int], wintypes.HICON] = {}
@@ -357,11 +374,26 @@ class SystemTrayIcon:
         self._thread.start()
         self._ready.wait(timeout=2.0)
 
-    def update_state(self, status: Optional[str] = None, port: Optional[str] = None) -> None:
-        """Updates the tray icon color and tooltip text to reflect current status and serial port."""
+    def update_state(
+        self,
+        status: Optional[str] = None,
+        port: Optional[str] = None,
+        event: Optional[Any] = None,
+    ) -> None:
+        """Updates the tray icon color, tooltip text, and context menu telemetry."""
         if sys.platform != "win32":
             return
         with self._lock:
+            if event is not None:
+                self._status = getattr(event, "status", self._status)
+                self._status_source = getattr(event, "status_source", self._status_source)
+                self._availability = getattr(event, "availability", self._availability)
+                self._log_source = getattr(event, "log_source", self._log_source)
+                self._meeting_count = getattr(event, "meeting_count", self._meeting_count)
+                self._mic_active = getattr(event, "mic_active", self._mic_active)
+                self._camera_active = getattr(event, "camera_active", self._camera_active)
+                self._is_locked = getattr(event, "is_locked", self._is_locked)
+                self._is_running = getattr(event, "is_running", self._is_running)
             if status is not None:
                 self._status = status
             self._port = port
@@ -389,17 +421,37 @@ class SystemTrayIcon:
             self._icon_cache[rgb] = hicon
         return self._icon_cache[rgb]
 
-    def _build_tooltip(self, status: str, port: Optional[str]) -> str:
-        port_label = f"RP2040 on {port}" if port else "Waiting for RP2040..."
-        on_air_States = ("InACall", "InAMeeting", "DoNotDisturb")
-        air_label = " [ON AIR]" if status in on_air_States else (" [PULSE]" if status == "Busy" else "")
-        tip = f"TeamsStatus: {status}{air_label} ({port_label})"
+    def _build_tooltip(
+        self,
+        status: str,
+        port: Optional[str],
+        status_source: str,
+        availability: str,
+        meeting_count: int,
+        mic_active: bool,
+        camera_active: bool,
+    ) -> str:
+        port_label = port if port else "No RP2040"
+        on_air_states = ("InACall", "InAMeeting", "DoNotDisturb")
+        air_label = " [ON AIR]" if status in on_air_states else (" [PULSE]" if status == "Busy" else "")
+        mic_str = "On" if mic_active else "Off"
+        cam_str = "On" if camera_active else "Off"
+        tip = (
+            f"TeamsStatus: {status}{air_label} ({port_label})\n"
+            f"Driven by: {status_source}\n"
+            f"Log: {availability} | Mtg: {meeting_count} | Mic: {mic_str} | Cam: {cam_str}"
+        )
         return tip[:127]
 
     def _refresh_notify_icon(self, modify: bool = True) -> None:
         with self._lock:
             status = self._status
             port = self._port
+            status_source = self._status_source
+            availability = self._availability
+            meeting_count = self._meeting_count
+            mic_active = self._mic_active
+            camera_active = self._camera_active
             hwnd = self._hwnd
             nid = self._nid
 
@@ -407,13 +459,29 @@ class SystemTrayIcon:
             return
 
         nid.hIcon = self._get_or_create_icon(status)
-        nid.szTip = self._build_tooltip(status, port)
+        nid.szTip = self._build_tooltip(
+            status=status,
+            port=port,
+            status_source=status_source,
+            availability=availability,
+            meeting_count=meeting_count,
+            mic_active=mic_active,
+            camera_active=camera_active,
+        )
         shell32.Shell_NotifyIconW(NIM_MODIFY if modify else NIM_ADD, ctypes.byref(nid))
 
     def _show_context_menu(self, hwnd: wintypes.HWND) -> None:
         with self._lock:
             status = self._status
             port = self._port
+            status_source = self._status_source
+            availability = self._availability
+            log_source = self._log_source
+            meeting_count = self._meeting_count
+            mic_active = self._mic_active
+            camera_active = self._camera_active
+            is_locked = self._is_locked
+            is_running = self._is_running
 
         hmenu = user32.CreatePopupMenu()
         if not hmenu:
@@ -421,9 +489,96 @@ class SystemTrayIcon:
 
         try:
             port_text = f"RP2040: Connected ({port})" if port else "RP2040: Disconnected (Auto-Scanning)"
+            log_detail = f"{availability} ({log_source})" if log_source != "None" else availability
+            mic_text = "Active (In Use)" if mic_active else "Inactive"
+            cam_text = "Active (In Use)" if camera_active else "Inactive"
+            session_text = "Locked" if is_locked else ("Unlocked (Teams Running)" if is_running else "Unlocked (Teams Stopped)")
+
             user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, "TeamsStatus Monitor")
             user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, f"Status: {status}")
+            user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, f"Driven By: {status_source}")
+            user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
+            user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, f"Teams Log: {log_detail}")
+            user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, f"Meeting Size: {meeting_count}")
+            user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, f"Microphone: {mic_text}")
+            user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, f"Camera: {cam_text}")
+            user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, f"Session: {session_text}")
             user32.AppendMenuW(hmenu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, port_text)
+
+            cmd_actions: Dict[int, Callable[[], None]] = {}
+            if self.priority_config is not None:
+                h_priority_menu = user32.CreatePopupMenu()
+                if h_priority_menu:
+                    next_cmd_id = 2000
+                    order, enabled = self.priority_config.snapshot()
+                    active_preset = self.priority_config.get_active_preset()
+                    labels = getattr(self.priority_config, "DRIVER_LABELS", {})
+                    presets = getattr(self.priority_config, "PRESETS", {})
+
+                    # 1. Presets submenu
+                    h_presets_menu = user32.CreatePopupMenu()
+                    if h_presets_menu:
+                        for preset_key, preset_tuple in presets.items():
+                            preset_label = preset_tuple[0]
+                            cid = next_cmd_id
+                            next_cmd_id += 1
+                            flags = MF_STRING | (MF_CHECKED if active_preset == preset_key else 0)
+                            user32.AppendMenuW(h_presets_menu, flags, cid, preset_label)
+                            cmd_actions[cid] = lambda pk=preset_key: self.priority_config.apply_preset(pk)
+                        user32.AppendMenuW(h_priority_menu, MF_POPUP, h_presets_menu, "Presets")
+                        user32.AppendMenuW(h_priority_menu, MF_SEPARATOR, 0, None)
+
+                    # 2. Ordered driver priority list with per-driver actions
+                    for idx, driver_id in enumerate(order):
+                        is_on = enabled.get(driver_id, True)
+                        label = labels.get(driver_id, driver_id)
+                        state_tag = "ON" if is_on else "OFF"
+                        h_driver_menu = user32.CreatePopupMenu()
+                        if h_driver_menu:
+                            # Toggle Enable / Disable
+                            cid_toggle = next_cmd_id
+                            next_cmd_id += 1
+                            toggle_label = "Enabled (Click to Disable)" if is_on else "Disabled (Click to Enable)"
+                            toggle_flags = MF_STRING | (MF_CHECKED if is_on else 0)
+                            user32.AppendMenuW(h_driver_menu, toggle_flags, cid_toggle, toggle_label)
+                            cmd_actions[cid_toggle] = lambda d=driver_id: self.priority_config.toggle(d)
+
+                            user32.AppendMenuW(h_driver_menu, MF_SEPARATOR, 0, None)
+
+                            # Move Up
+                            cid_up = next_cmd_id
+                            next_cmd_id += 1
+                            up_flags = MF_STRING | (MF_GRAYED | MF_DISABLED if idx == 0 else 0)
+                            user32.AppendMenuW(h_driver_menu, up_flags, cid_up, "Move Up (Higher Priority)")
+                            if idx > 0:
+                                cmd_actions[cid_up] = lambda d=driver_id: self.priority_config.move_up(d)
+
+                            # Move Down
+                            cid_down = next_cmd_id
+                            next_cmd_id += 1
+                            down_flags = MF_STRING | (MF_GRAYED | MF_DISABLED if idx == len(order) - 1 else 0)
+                            user32.AppendMenuW(h_driver_menu, down_flags, cid_down, "Move Down (Lower Priority)")
+                            if idx < len(order) - 1:
+                                cmd_actions[cid_down] = lambda d=driver_id: self.priority_config.move_down(d)
+
+                            parent_flags = MF_POPUP | (MF_CHECKED if is_on else 0)
+                            user32.AppendMenuW(
+                                h_priority_menu,
+                                parent_flags,
+                                h_driver_menu,
+                                f"{idx + 1}. [{state_tag}] {label}",
+                            )
+
+                    # 3. Reset to Defaults
+                    user32.AppendMenuW(h_priority_menu, MF_SEPARATOR, 0, None)
+                    cid_reset = next_cmd_id
+                    next_cmd_id += 1
+                    user32.AppendMenuW(h_priority_menu, MF_STRING, cid_reset, "Reset to Default Priority")
+                    cmd_actions[cid_reset] = lambda: self.priority_config.reset_defaults()
+
+                    user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
+                    user32.AppendMenuW(hmenu, MF_POPUP, h_priority_menu, "Priority & Signals (Top Wins)")
+
             user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
             user32.AppendMenuW(hmenu, MF_STRING, ID_TRAY_STOP, "Stop TeamsMonitor")
 
@@ -451,6 +606,15 @@ class SystemTrayIcon:
                     self.on_stop()
                 finally:
                     user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            elif cmd in cmd_actions:
+                cmd_actions[cmd]()
+                if hasattr(self.priority_config, "save_to_registry"):
+                    self.priority_config.save_to_registry()
+                if self.on_config_change is not None:
+                    try:
+                        self.on_config_change()
+                    except Exception:
+                        pass
         finally:
             user32.DestroyMenu(hmenu)
 
